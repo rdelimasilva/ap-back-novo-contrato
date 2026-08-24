@@ -5,3 +5,4 @@ __pycache__/
 staticfiles/
 logs/
 *.pem
+.superpowers/sdd/
