@@ -10,9 +10,10 @@ Novo microserviço Python/Django, irmão do `ap-back-optin` (mesma squad, mesmo 
 - **Sem Django ORM.** `DATABASES = {}` no settings; acesso a dados via `CloudSqlClient`, wrapper próprio (SQLAlchemy + Cloud SQL Python Connector) com API estilo Supabase/PostgREST (`.table("contrato").insert(...).execute()`). Código **copiado** de `ap-back-optin/optin/shared/cloudsql_client.py`, sem virar dependência de package compartilhado entre os repos.
 - **Deploy em Cloud Run**, sem Celery. Assíncrono via **Pub/Sub** (webhook) e **Cloud Scheduler** (jobs periódicos).
 - **Sem DRF ViewSets** — function-based views + validação manual.
-- **Schema versionado em SQL puro**, numerado (`docker/initdb/NN-descricao.sql`), sem framework de migration.
+- **Schema versionado em SQL puro**, numerado (`sql/schema/NN-descricao.sql`), sem framework de migration.
 - **Autenticação CERC own-service:** `services/cerc/token_provider.py` **copiado** de `ap-back-optin` (OAuth2 client-credentials, cache em memória por processo, renovação proativa a 80% de `expires_in`, single-flight via lock). **Decisão explícita:** este serviço **não** depende do `ap-back-optin` em runtime — nenhum roteamento de token ou de chamadas via outro serviço. Cada serviço autentica direto na CERC com suas próprias credenciais, mesmo padrão, zero acoplamento entre processos.
-- **GCP:** mesmo projeto GCP do `ap-back-optin` (governança única para os serviços novos da CERC), mas com **Cloud SQL, tópico Pub/Sub e serviço Cloud Run dedicados** a este serviço — nenhum dado ou infra de runtime compartilhada com o optin.
+- **GCP:** projeto `registradora-506000` (mesmo projeto onde já roda a instância Cloud SQL `app-db` de outro serviço da casa), mas com **instância Cloud SQL, tópico Pub/Sub e serviço Cloud Run dedicados** a este serviço — decisão explícita, dado o volume de dados alto esperado para contratos (não a instância `app-db` compartilhada, nem uma instância genérica por padrão). Instância provisionada: `contratos-db` (Postgres 16, `us-east1`), banco `contratos`, usuário `contratos_app`.
+- **Dev local sem Docker:** esta máquina de desenvolvimento não tem Docker instalado. Diferente do `ap-back-optin` (que usa `docker-compose` + Postgres local), o dev deste serviço conecta **direto na instância Cloud SQL real** (`contratos-db`) via `CLOUDSQL_CONNECTION_NAME` no `.env` local — o mesmo caminho de conexão que produção usa (Cloud SQL Python Connector), só que apontado para uma instância de baixo custo (`db-f1-micro`) usada como ambiente de dev/homolog. `scripts/apply_schema.py` aplica os arquivos de `sql/schema/` nela (substitui o mecanismo de init-script do docker-compose).
 
 ## 2. Estrutura de pastas
 
@@ -20,8 +21,9 @@ Novo microserviço Python/Django, irmão do `ap-back-optin` (mesma squad, mesmo 
 contratos/
 ├── manage.py
 ├── requirements.txt
-├── Dockerfile / docker-compose.yml
-├── docker/initdb/                # DDL versionado (01-contratos-schema.sql = subconjunto fase 1 do §11 da SPEC-02)
+├── Dockerfile
+├── sql/schema/                   # DDL versionado (01-contratos-schema.sql = subconjunto fase 1 do §11 da SPEC-02)
+├── scripts/apply_schema.py       # aplica um arquivo .sql no Cloud SQL real via Cloud SQL Python Connector
 ├── config/                       # settings.py (DATABASES={}), urls.py, wsgi.py
 ├── apps/
 │   └── contratos/
@@ -50,11 +52,11 @@ Decisões YAGNI explícitas (mesmo espírito do optin):
 
 ## 3. Camada de dados — fase 1
 
-Tabelas do §11 da SPEC-02 usadas por **esta fase**: `contrato`, `contrato_contrato_anterior`, `contrato_parcela`, `contrato_domicilio`, `garantia`, `garantia_ur`, `indicador_consistencia`, `contrato_evento`, `cerc_requisicao`, `webhook_inbox`, `dominio_arranjo`. Virão para `docker/initdb/01-contratos-schema.sql`, copiadas da spec quase literalmente (já é DDL Postgres válida).
+Tabelas do §11 da SPEC-02 usadas por **esta fase**: `contrato`, `contrato_contrato_anterior`, `contrato_parcela`, `contrato_domicilio`, `garantia`, `garantia_ur`, `indicador_consistencia`, `contrato_evento`, `cerc_requisicao`, `webhook_inbox`, `dominio_arranjo`. Virão para `sql/schema/01-contratos-schema.sql`, copiadas da spec quase literalmente (já é DDL Postgres válida), aplicadas na instância real via `scripts/apply_schema.py` (ver §1 — sem Docker nesta máquina).
 
 **Fora da fase 1:** `simulacao_contrato` (entra com `tipoOperacao = S`, fase 2) e `divergencia_ap013` (entra com o ingestor de reconciliação, fase 2/3) — criar essas tabelas agora seria schema sem código que as use.
 
-Instância Cloud SQL dedicada a este serviço (própria de `contrato`, distinta da instância do optin — nenhum dado de opt-in trafega aqui). `dominio_arranjo` é uma cópia local sincronizada por job próprio (`sincronizar_dominio_arranjo`) — não há leitura cross-serviço da tabela do optin.
+Instância Cloud SQL dedicada a este serviço (`contratos-db`, projeto `registradora-506000`, distinta da instância `app-db` de outro serviço — nenhum dado de outro serviço trafega aqui), decisão confirmada com o usuário dado o volume de dados alto esperado. `dominio_arranjo` é uma cópia local sincronizada por job próprio (`sincronizar_dominio_arranjo`) — não há leitura cross-serviço de outra tabela.
 
 Tipos monetários: `NUMERIC(18,2)` no Postgres, `decimal.Decimal` em Python. **Proibido `float`/`double`** em qualquer campo de valor (requisito explícito da SPEC-02 §13.3, verificado por teste).
 
