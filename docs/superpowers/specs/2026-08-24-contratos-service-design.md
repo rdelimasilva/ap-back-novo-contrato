@@ -12,8 +12,21 @@ Novo microserviço Python/Django, irmão do `ap-back-optin` (mesma squad, mesmo 
 - **Sem DRF ViewSets** — function-based views + validação manual.
 - **Schema versionado em SQL puro**, numerado (`sql/schema/NN-descricao.sql`), sem framework de migration.
 - **Autenticação CERC own-service:** `services/cerc/token_provider.py` **copiado** de `ap-back-optin` (OAuth2 client-credentials, cache em memória por processo, renovação proativa a 80% de `expires_in`, single-flight via lock). **Decisão explícita:** este serviço **não** depende do `ap-back-optin` em runtime — nenhum roteamento de token ou de chamadas via outro serviço. Cada serviço autentica direto na CERC com suas próprias credenciais, mesmo padrão, zero acoplamento entre processos.
-- **GCP:** projeto `registradora-506000` (mesmo projeto onde já roda a instância Cloud SQL `app-db` de outro serviço da casa), mas com **instância Cloud SQL, tópico Pub/Sub e serviço Cloud Run dedicados** a este serviço — decisão explícita, dado o volume de dados alto esperado para contratos (não a instância `app-db` compartilhada, nem uma instância genérica por padrão). Instância provisionada: `contratos-db` (Postgres 16, `us-east1`), banco `contratos`, usuário `contratos_app`.
-- **Dev local sem Docker:** esta máquina de desenvolvimento não tem Docker instalado. Diferente do `ap-back-optin` (que usa `docker-compose` + Postgres local), o dev deste serviço conecta **direto na instância Cloud SQL real** (`contratos-db`) via `CLOUDSQL_CONNECTION_NAME` no `.env` local — o mesmo caminho de conexão que produção usa (Cloud SQL Python Connector), só que apontado para uma instância de baixo custo (`db-f1-micro`) usada como ambiente de dev/homolog. `scripts/apply_schema.py` aplica os arquivos de `sql/schema/` nela (substitui o mecanismo de init-script do docker-compose).
+- **GCP:** projeto `registradora-506000` (mesmo projeto onde já roda a instância Cloud SQL `app-db` de outro serviço da casa). Deploy em Cloud Run/Pub/Sub dedicados a este serviço.
+- **Dev local sem Docker:** esta máquina de desenvolvimento não tem Docker instalado. Diferente do `ap-back-optin` (que usa `docker-compose` + Postgres local), o dev deste serviço conecta **direto num Cloud SQL real** via Cloud SQL Python Connector — o mesmo caminho de conexão que produção usa, só que apontado para uma instância de baixo custo (`db-f1-micro`) usada como ambiente de dev/homolog. `scripts/apply_schema.py` aplica os arquivos de `sql/schema/` nela (substitui o mecanismo de init-script do docker-compose).
+
+### 1.1 Multi-tenancy
+
+Descoberta em 24/08 durante a implementação: o `ap-back-optin` evoluiu (em sessão separada, `docs/superpowers/specs/2026-08-24-multitenancy-design.md` daquele repo, Plan 09) para atender **múltiplos financiadores**, cada um como tenant isolado — isolamento **por banco inteiro** (uma instância Cloud SQL por tenant), não coluna `financiador_id` em tabelas compartilhadas. Confirmado com o usuário: **contratos segue o mesmo modelo.**
+
+- **Identidade do tenant:** `financiador_id` = o próprio `cnpjParticipante` (14 dígitos) — igual à decisão do optin (lá é `cnpjFinanciador`), evita campo duplicado que pode divergir.
+- **Config por tenant:** segredo `TENANT_{financiador_id}_CONFIG_CONTRATOS` (JSON) via `shared/secrets.py` (inalterado). **Nome diferente do optin** (`TENANT_{financiador_id}_CONFIG`, sem sufixo) — são segredos separados por serviço, mesmo raciocínio de "cada serviço com suas próprias credenciais CERC" já decidido (§1): evita colidir no Secret Manager (nomes de segredo são únicos por projeto GCP) e evita acoplar o formato desse segredo ao contrato já publicado do optin (§9 do design doc dele). Chaves do JSON: `cloudsql_connection_name`, `cloudsql_db_user`, `cloudsql_db_password`, `cloudsql_db_name`, `cloudsql_ip_type` (opcional, default `PUBLIC` — mantém a melhoria do Plano 03 sobre o padrão do optin), `cerc_client_id`, `cerc_client_secret`. Sem `cerc_cnpj_solicitante`: a SPEC-02 não tem esse conceito — `cnpjParticipante` é sempre o `financiador_id`.
+- **`shared/tenant_config.py`:** novo módulo, mesmo formato do optin (cache em memória por processo, sem TTL), mas lendo o segredo com sufixo `_CONTRATOS`.
+- **`shared/cloudsql_client.py`:** `get_db()` (singleton único, do Plano 03) vira `get_db(financiador_id: str)`, cache `dict[str, CloudSQLClient]` com lock por tenant (double-checked, mesmo padrão que o optin corrigiu depois de um bug real de vazamento de engine). `LOCAL_DATABASE_URL` é **removido** — único caminho de conexão é por tenant, mesmo em dev. `.upsert()` (adição deste serviço, não existe no optin) é preservado.
+- **`services/cerc/token_provider.py`:** `get_cerc_token(financiador_id)`/`invalidate_token(financiador_id)`, cache/lock por tenant, credenciais via `get_tenant_config(financiador_id)`. `CERC_AUTH_URL`/`CERC_API_BASE_URL` continuam env var global (host do ambiente, não varia por tenant).
+- **`services/cerc/client.py` (Plano 07, ainda não construído):** todas as funções ganham `financiador_id` como primeiro parâmetro desde o início — sem retrofit necessário, ao contrário do optin (que já tinha `client.py` pronto quando essa decisão chegou).
+- **Tenant de dev/teste:** reaproveita o CNPJ de dev do optin, `12345678000199`, apontando pra instância `contratos-db` já provisionada (ela deixa de ser "o banco do serviço" e vira "o banco desse tenant de dev para o serviço de contratos" — nenhuma mudança de infra necessária, só reorganização conceitual + o schema já aplicado nela continua válido).
+- **Onboarding de tenant:** manual/scriptado por enquanto (poucos tenants esperados), mesmo raciocínio YAGNI do optin — sem automação de self-service agora.
 
 ## 2. Estrutura de pastas
 
@@ -34,11 +47,11 @@ contratos/
 │       └── management/commands/  # reconciliar_pendentes, sincronizar_dominio_arranjo
 ├── services/
 │   └── cerc/
-│       ├── token_provider.py     # copiado de ap-back-optin — OAuth2 client-credentials
-│       └── client.py             # criar_contrato / atualizar_contrato / inativar_contrato /
-│                                   # baixar_contrato / consultar_contrato
+│       ├── token_provider.py     # get_cerc_token(financiador_id) — multi-tenant, §1.1
+│       └── client.py             # criar_contrato(financiador_id, ...) / atualizar_contrato / ...
 └── shared/
-    ├── cloudsql_client.py        # copiado de ap-back-optin
+    ├── cloudsql_client.py        # get_db(financiador_id) — multi-tenant, §1.1
+    ├── tenant_config.py           # get_tenant_config(financiador_id) — TENANT_{id}_CONFIG_CONTRATOS, §1.1
     ├── pubsub_client.py           # publish helper (webhook inbox)
     └── secrets.py                 # copiado de ap-back-optin — leitura via Secret Manager
 ```
@@ -56,7 +69,7 @@ Tabelas do §11 da SPEC-02 usadas por **esta fase**: `contrato`, `contrato_contr
 
 **Fora da fase 1:** `simulacao_contrato` (entra com `tipoOperacao = S`, fase 2) e `divergencia_ap013` (entra com o ingestor de reconciliação, fase 2/3) — criar essas tabelas agora seria schema sem código que as use.
 
-Instância Cloud SQL dedicada a este serviço (`contratos-db`, projeto `registradora-506000`, distinta da instância `app-db` de outro serviço — nenhum dado de outro serviço trafega aqui), decisão confirmada com o usuário dado o volume de dados alto esperado. `dominio_arranjo` é uma cópia local sincronizada por job próprio (`sincronizar_dominio_arranjo`) — não há leitura cross-serviço de outra tabela.
+**Uma instância Cloud SQL por tenant (financiador), por serviço** (§1.1) — não uma instância única compartilhada por todos os financiadores. `contratos-db` (projeto `registradora-506000`) é a instância do **tenant de dev/teste** (`12345678000199`), não "a instância do serviço"; cada tenant real terá a sua própria, provisionada quando o tenant for cadastrado. Distinta da instância `app-db` (que é o tenant de dev do optin) — nenhum dado de outro serviço trafega aqui, mesmo para o mesmo tenant. `dominio_arranjo` é uma cópia local sincronizada por job próprio (`sincronizar_dominio_arranjo`) — não há leitura cross-serviço de outra tabela.
 
 Tipos monetários: `NUMERIC(18,2)` no Postgres, `decimal.Decimal` em Python. **Proibido `float`/`double`** em qualquer campo de valor (requisito explícito da SPEC-02 §13.3, verificado por teste).
 
