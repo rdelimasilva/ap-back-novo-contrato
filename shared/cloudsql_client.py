@@ -13,6 +13,7 @@ nesta máquina, que não tem Docker.
 import json
 import logging
 import os
+import threading
 from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class QueryBuilder:
         self._insert_data = None
         self._update_data: Optional[dict] = None
         self._on_conflict: Optional[str] = None
+        self._allow_all = False
 
     def select(self, fields: str = "*", count: Optional[str] = None) -> "QueryBuilder":
         self._select_fields = fields
@@ -66,13 +68,15 @@ class QueryBuilder:
         self._on_conflict = on_conflict
         return self
 
-    def update(self, data: dict) -> "QueryBuilder":
+    def update(self, data: dict, *, allow_all: bool = False) -> "QueryBuilder":
         self._op = "update"
         self._update_data = data
+        self._allow_all = allow_all
         return self
 
-    def delete(self) -> "QueryBuilder":
+    def delete(self, *, allow_all: bool = False) -> "QueryBuilder":
         self._op = "delete"
+        self._allow_all = allow_all
         return self
 
     def execute(self) -> ExecuteResult:
@@ -88,6 +92,13 @@ class QueryBuilder:
             logger.exception("[CloudSQL] Erro em %s.%s", self._table, self._op)
             raise
 
+    def _check_unfiltered(self) -> None:
+        if not self._filters and not self._allow_all:
+            raise ValueError(
+                f"{self._table}.{self._op}() sem nenhum .eq() afetaria a tabela inteira — "
+                f"passe allow_all=True se isso for intencional."
+            )
+
     def _build_where(self):
         if not self._filters:
             return "", {}
@@ -101,8 +112,16 @@ class QueryBuilder:
 
     @staticmethod
     def _serialize(v: Any) -> Any:
-        if isinstance(v, (dict, list)):
+        if isinstance(v, dict):
             return json.dumps(v, ensure_ascii=False, default=str)
+        if isinstance(v, list):
+            # Lista de escalares (ex.: TEXT[] como garantia.def_lista_arranjos) vira
+            # array nativo do Postgres — passada direto, pg8000 sabe bindá-la. Lista
+            # com dict/list aninhado não cabe num array nativo (que é homogêneo e
+            # escalar), então só nesse caso vira JSON (ex.: indicador_consistencia.parametros).
+            if any(isinstance(item, (dict, list)) for item in v):
+                return json.dumps(v, ensure_ascii=False, default=str)
+            return v
         return v
 
     @staticmethod
@@ -174,6 +193,7 @@ class QueryBuilder:
     def _exec_update(self) -> ExecuteResult:
         from sqlalchemy import text
 
+        self._check_unfiltered()
         serialized = {k: self._serialize(v) for k, v in self._update_data.items()}
         set_clause = ", ".join(f"{k} = :u_{k}" for k in serialized)
         params = {f"u_{k}": v for k, v in serialized.items()}
@@ -187,6 +207,7 @@ class QueryBuilder:
     def _exec_delete(self) -> ExecuteResult:
         from sqlalchemy import text
 
+        self._check_unfiltered()
         where, params = self._build_where()
         sql = f"DELETE FROM {self._table} {where} RETURNING *"
         with self._engine.begin() as conn:
@@ -208,7 +229,7 @@ def _create_engine():
     local_url = os.getenv("LOCAL_DATABASE_URL")
     if local_url:
         logger.info("[CloudSQL] Engine LOCAL via LOCAL_DATABASE_URL")
-        return sqlalchemy.create_engine(local_url, pool_pre_ping=True)
+        return sqlalchemy.create_engine(local_url, pool_pre_ping=True, hide_parameters=True)
 
     connection_name = os.getenv("CLOUDSQL_CONNECTION_NAME")
     if not connection_name:
@@ -229,19 +250,30 @@ def _create_engine():
 
     logger.info("[CloudSQL] Engine criado para %s (ip_type=%s)", connection_name, ip_type.name)
     return sqlalchemy.create_engine(
-        "postgresql+pg8000://", creator=getconn, pool_size=5, max_overflow=2, pool_timeout=30, pool_recycle=1800,
+        "postgresql+pg8000://",
+        creator=getconn,
+        pool_size=5,
+        max_overflow=2,
+        pool_timeout=30,
+        pool_recycle=1800,
+        pool_pre_ping=True,
+        hide_parameters=True,
     )
 
 
 _client: Optional[CloudSQLClient] = None
+_lock = threading.Lock()
 
 
 def get_db() -> Optional[CloudSQLClient]:
     global _client
     if _client is not None:
         return _client
-    engine = _create_engine()
-    if engine is None:
-        return None
-    _client = CloudSQLClient(engine)
-    return _client
+    with _lock:
+        if _client is not None:
+            return _client
+        engine = _create_engine()
+        if engine is None:
+            return None
+        _client = CloudSQLClient(engine)
+        return _client
