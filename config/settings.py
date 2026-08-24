@@ -14,11 +14,20 @@ INSTALLED_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.auth",
     "rest_framework",
+    "corsheaders",
     "apps.contratos",
 ]
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
+]
+
+# Front-end (ap-front) consome esta API via fetch do browser — precisa de
+# CORS liberado pra origem dele. Vazio por padrão (nenhuma origem liberada)
+# até CORS_ALLOWED_ORIGINS ser configurado; em dev local aponta pro Vite.
+CORS_ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()
 ]
 
 ROOT_URLCONF = "config.urls"
