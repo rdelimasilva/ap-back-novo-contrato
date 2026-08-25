@@ -2,16 +2,23 @@ import base64
 import hmac
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from django.http import JsonResponse
 from django.views.decorators.http import require_POST
 from sqlalchemy.exc import DBAPIError
 from ulid import ULID
 
+from apps.contratos import state_machine
 from apps.contratos.webhook_dedupe import hash_evento
+from apps.contratos.webhook_processor import (
+    atualizacoes_contrato_do_evento,
+    garantia_urs_do_evento,
+    indicadores_do_evento,
+)
 from shared import pubsub_client
 from shared.cloudsql_client import get_db
+from shared.pubsub_auth import verificar_push_oidc
 from shared.tenant_config import get_tenant_config
 
 logger = logging.getLogger(__name__)
@@ -136,3 +143,128 @@ def webhook_contrato(request, financiador_id: str):
         logger.exception("[Webhook] publish_webhook_contrato levantou inesperadamente (financiador=%s)", financiador_id)
 
     return JsonResponse({}, status=202)
+
+
+@require_POST
+def processar_webhook_contrato(request):
+    """Consumidor da push subscription do Pub/Sub — aplica a máquina de
+    estados (§8) sobre o evento já persistido em webhook_inbox pelo
+    receptor (Plano 10). Verificado por OIDC (design §6). Idempotente sob
+    reentrega do Pub/Sub (at-least-once): o guard de
+    webhook_inbox.processado_em evita refazer qualquer escrita."""
+    if not verificar_push_oidc(request):
+        return JsonResponse({"erro": "OIDC inválido"}, status=401)
+
+    try:
+        envelope = json.loads(request.body)
+        dados = json.loads(base64.b64decode(envelope["message"]["data"]))
+        webhook_inbox_id = dados["webhook_inbox_id"]
+        financiador_id = dados["financiador_id"]
+    except Exception:
+        logger.exception("[Processor] Envelope do Pub/Sub push malformado")
+        return JsonResponse({"erro": "envelope inválido"}, status=400)
+
+    db = get_db(financiador_id)
+    linhas_inbox = db.table("webhook_inbox").select("*").eq("id", webhook_inbox_id).execute()
+    if not linhas_inbox.data:
+        logger.error("[Processor] webhook_inbox_id=%s não encontrado (financiador=%s)", webhook_inbox_id, financiador_id)
+        return JsonResponse({"erro": "webhook_inbox não encontrado"}, status=404)
+    inbox = linhas_inbox.data[0]
+
+    if inbox["processado_em"] is not None:
+        return JsonResponse({}, status=204)
+
+    payload = inbox["payload"]
+    tipo_evento = payload.get("tipoEvento")
+    evento = payload.get("evento")
+
+    if tipo_evento != "contrato":
+        logger.warning("[Processor] tipoEvento=%s fora do escopo deste consumidor, ignorando", tipo_evento)
+        db.table("webhook_inbox").update({"processado_em": datetime.now(timezone.utc)}).eq("id", webhook_inbox_id).execute()
+        return JsonResponse({}, status=204)
+
+    referencia_externa = evento.get("referenciaExterna")
+    contratos = db.table("contrato").select("*").eq("referencia_externa", referencia_externa).execute()
+    if not contratos.data:
+        logger.error(
+            "[Processor] contrato referencia_externa=%s não encontrado (financiador=%s) — deixando para nova entrega do Pub/Sub",
+            referencia_externa, financiador_id,
+        )
+        return JsonResponse({"erro": "contrato não encontrado"}, status=500)
+    contrato = contratos.data[0]
+
+    try:
+        novo_status = state_machine.estado_apos_webhook(contrato["status"], evento["status"])
+    except state_machine.EstadoInvalidoError:
+        logger.warning(
+            "[Processor] webhook para contrato %s chegou em estado inesperado (%s) — tratando como já processado",
+            contrato["id"], contrato["status"],
+        )
+        db.table("webhook_inbox").update({
+            "processado_em": datetime.now(timezone.utc), "erro": "estado inválido para webhook",
+        }).eq("id", webhook_inbox_id).execute()
+        return JsonResponse({}, status=204)
+
+    atualizacoes = atualizacoes_contrato_do_evento(evento)
+    if atualizacoes.get("confirmado_em"):
+        atualizacoes["confirmado_em"] = datetime.fromisoformat(atualizacoes["confirmado_em"])
+    atualizacoes["status"] = novo_status
+    db.table("contrato").update(atualizacoes).eq("id", contrato["id"]).execute()
+
+    if evento.get("status") == "0":
+        data_processamento = evento.get("dataHoraProcessamento")
+        snapshot_em = datetime.fromisoformat(data_processamento) if data_processamento else datetime.now(timezone.utc)
+
+        for ur in garantia_urs_do_evento(evento, snapshot_em):
+            referencia_garantia = ur.pop("referencia_externa_garantia")
+            garantias = (
+                db.table("garantia").select("id")
+                .eq("contrato_id", contrato["id"]).eq("referencia_externa", referencia_garantia)
+                .execute()
+            )
+            if not garantias.data:
+                logger.warning(
+                    "[Processor] garantia referencia_externa=%s não encontrada no contrato %s — UR ignorada",
+                    referencia_garantia, contrato["id"],
+                )
+                continue
+            ur["garantia_id"] = garantias.data[0]["id"]
+            db.table("garantia_ur").upsert(
+                ur,
+                # NOTA (desvio do brief): a PK original de garantia_ur foi substituída
+                # em sql/schema/02-contratos-schema-fixes.sql por um id BIGSERIAL + um
+                # índice único FUNCIONAL (garantia_ur_natural_key) que envolve
+                # documento_ufr/documento_titular em COALESCE(..., '') — necessário
+                # porque a SPEC-02 §4.4 marca os dois como opcionais e a PK antiga os
+                # tornava implicitamente NOT NULL. O Postgres só infere um índice de
+                # arbitragem para ON CONFLICT quando a lista de colunas bate
+                # exatamente com as expressões do índice (erro 42P10 confirmado
+                # contra o Cloud SQL real deste tenant ao usar os nomes de coluna
+                # nus, como o brief especificava) — por isso replicamos aqui as
+                # mesmas expressões COALESCE do índice.
+                on_conflict=(
+                    "garantia_id, cnpj_credenciadora, COALESCE(documento_ufr, ''), "
+                    "COALESCE(documento_titular, ''), codigo_arranjo, data_liquidacao, origem"
+                ),
+            ).execute()
+
+        for indicador in indicadores_do_evento(evento, snapshot_em):
+            indicador["contrato_id"] = contrato["id"]
+            db.table("indicador_consistencia").upsert(
+                indicador, on_conflict="contrato_id, indicador, observado_em",
+            ).execute()
+
+        if state_machine.eh_subgarantido(evento.get("resultadoDistribuicaoOnus")):
+            db.table("contrato_evento").insert({
+                "contrato_id": contrato["id"], "tipo": "ContratoSubgarantido",
+                "payload": evento, "ocorrido_em": snapshot_em,
+            }).execute()
+
+    db.table("contrato_evento").insert({
+        "contrato_id": contrato["id"], "tipo": "webhook_recebido",
+        "payload": payload, "ocorrido_em": datetime.now(timezone.utc),
+    }).execute()
+
+    db.table("webhook_inbox").update({"processado_em": datetime.now(timezone.utc)}).eq("id", webhook_inbox_id).execute()
+
+    return JsonResponse({}, status=204)
