@@ -34,7 +34,20 @@ def verificar_push_oidc(request) -> bool:
         return False
 
     conta_esperada = os.getenv("PUBSUB_PUSH_INVOKER_SA")
-    if conta_esperada and claims.get("email") != conta_esperada:
+    if not conta_esperada:
+        # A claim `audience` de um ID token OIDC do Google NÃO é uma fronteira de
+        # autenticação por si só — qualquer identidade Google autenticada pode
+        # pedir um ID token para QUALQUER string de audiência (ex.: via
+        # `gcloud auth print-identity-token --audiences=<qualquer-url>`), então
+        # verificar só a audiência não verifica QUEM está chamando. Como
+        # financiador_id vem no payload do push (e seleciona em qual banco de
+        # tenant a escrita acontece), aceitar "qualquer audiência válida" deixaria
+        # um chamador não-autenticado-por-identidade escrever em qualquer tenant.
+        # Mesmo princípio já adotado em _autenticado (views.py): config vazia/
+        # ausente é recusada, nunca tratada como "autentica qualquer um".
+        logger.error("[Processor] PUBSUB_PUSH_INVOKER_SA não configurado — recusando toda requisição de push")
+        return False
+    if claims.get("email") != conta_esperada:
         logger.warning("[Processor] Token OIDC de conta inesperada: %s", claims.get("email"))
         return False
 

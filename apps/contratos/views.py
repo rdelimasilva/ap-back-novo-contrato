@@ -160,15 +160,23 @@ def processar_webhook_contrato(request):
         dados = json.loads(base64.b64decode(envelope["message"]["data"]))
         webhook_inbox_id = dados["webhook_inbox_id"]
         financiador_id = dados["financiador_id"]
+        # get_db(financiador_id) dentro deste try de propósito: um financiador_id
+        # desconhecido/config de tenant irresolvível é, do ponto de vista deste
+        # endpoint, tão "esta mensagem de push não pode ser processada" quanto um
+        # envelope malformado — deve virar 400, não um 500 genérico não tratado.
+        db = get_db(financiador_id)
     except Exception:
-        logger.exception("[Processor] Envelope do Pub/Sub push malformado")
+        logger.exception("[Processor] Envelope do Pub/Sub push malformado ou financiador_id não resolvível")
         return JsonResponse({"erro": "envelope inválido"}, status=400)
 
-    db = get_db(financiador_id)
     linhas_inbox = db.table("webhook_inbox").select("*").eq("id", webhook_inbox_id).execute()
     if not linhas_inbox.data:
-        logger.error("[Processor] webhook_inbox_id=%s não encontrado (financiador=%s)", webhook_inbox_id, financiador_id)
-        return JsonResponse({"erro": "webhook_inbox não encontrado"}, status=404)
+        # Condição permanentemente irrecuperável — esta linha nunca vai aparecer
+        # depois, então continuar retentando via não-2xx não tem propósito (o
+        # Pub/Sub reentregaria por dias até a retenção expirar e então descartar
+        # silenciosamente). Confirma a entrega (204) para parar a reentrega.
+        logger.error("[Processor] webhook_inbox_id=%s não encontrado (financiador=%s) — condição permanentemente irrecuperável, confirmando entrega", webhook_inbox_id, financiador_id)
+        return JsonResponse({}, status=204)
     inbox = linhas_inbox.data[0]
 
     if inbox["processado_em"] is not None:
@@ -186,10 +194,19 @@ def processar_webhook_contrato(request):
     referencia_externa = evento.get("referenciaExterna")
     contratos = db.table("contrato").select("*").eq("referencia_externa", referencia_externa).execute()
     if not contratos.data:
+        # Este caso genuinamente pode ser transitório (o fluxo de criação do
+        # contrato que geraria esta linha pode ainda não ter rodado), então
+        # mantemos o 500 (nova entrega do Pub/Sub tentará de novo) e NÃO tocamos
+        # processado_em. Mas registramos uma pista de diagnóstico em `erro` para
+        # que um operador consultando webhook_inbox WHERE erro IS NOT NULL veja
+        # por que a linha está travada, em vez de precisar vasculhar logs.
         logger.error(
             "[Processor] contrato referencia_externa=%s não encontrado (financiador=%s) — deixando para nova entrega do Pub/Sub",
             referencia_externa, financiador_id,
         )
+        db.table("webhook_inbox").update({
+            "erro": f"contrato referencia_externa={referencia_externa} não encontrado",
+        }).eq("id", webhook_inbox_id).execute()
         return JsonResponse({"erro": "contrato não encontrado"}, status=500)
     contrato = contratos.data[0]
 
@@ -205,65 +222,92 @@ def processar_webhook_contrato(request):
         }).eq("id", webhook_inbox_id).execute()
         return JsonResponse({}, status=204)
 
-    atualizacoes = atualizacoes_contrato_do_evento(evento)
-    if atualizacoes.get("confirmado_em"):
-        atualizacoes["confirmado_em"] = datetime.fromisoformat(atualizacoes["confirmado_em"])
-    atualizacoes["status"] = novo_status
-    db.table("contrato").update(atualizacoes).eq("id", contrato["id"]).execute()
+    # A partir daqui, qualquer exceção inesperada (payload malformado da CERC
+    # levando a um ValueError em state_machine, erro de tipo no banco, etc.)
+    # é colocada em quarentena em vez de propagar como 500 — sem isso, o
+    # Pub/Sub reentregaria a MESMA mensagem "poison pill" indefinidamente,
+    # martelando o endpoint sem nenhuma chance de sucesso. EstadoInvalidoError
+    # já foi tratado acima, antes de qualquer escrita, e não passa por aqui.
+    try:
+        atualizacoes = atualizacoes_contrato_do_evento(evento)
+        if atualizacoes.get("confirmado_em"):
+            atualizacoes["confirmado_em"] = datetime.fromisoformat(atualizacoes["confirmado_em"])
+        atualizacoes["status"] = novo_status
 
-    if evento.get("status") == "0":
-        data_processamento = evento.get("dataHoraProcessamento")
-        snapshot_em = datetime.fromisoformat(data_processamento) if data_processamento else datetime.now(timezone.utc)
+        if evento.get("status") == "0":
+            data_processamento = evento.get("dataHoraProcessamento")
+            snapshot_em = datetime.fromisoformat(data_processamento) if data_processamento else datetime.now(timezone.utc)
 
-        for ur in garantia_urs_do_evento(evento, snapshot_em):
-            referencia_garantia = ur.pop("referencia_externa_garantia")
-            garantias = (
-                db.table("garantia").select("id")
-                .eq("contrato_id", contrato["id"]).eq("referencia_externa", referencia_garantia)
-                .execute()
-            )
-            if not garantias.data:
-                logger.warning(
-                    "[Processor] garantia referencia_externa=%s não encontrada no contrato %s — UR ignorada",
-                    referencia_garantia, contrato["id"],
+            for ur in garantia_urs_do_evento(evento, snapshot_em):
+                referencia_garantia = ur.pop("referencia_externa_garantia")
+                garantias = (
+                    db.table("garantia").select("id")
+                    .eq("contrato_id", contrato["id"]).eq("referencia_externa", referencia_garantia)
+                    .execute()
                 )
-                continue
-            ur["garantia_id"] = garantias.data[0]["id"]
-            db.table("garantia_ur").upsert(
-                ur,
-                # NOTA (desvio do brief): a PK original de garantia_ur foi substituída
-                # em sql/schema/02-contratos-schema-fixes.sql por um id BIGSERIAL + um
-                # índice único FUNCIONAL (garantia_ur_natural_key) que envolve
-                # documento_ufr/documento_titular em COALESCE(..., '') — necessário
-                # porque a SPEC-02 §4.4 marca os dois como opcionais e a PK antiga os
-                # tornava implicitamente NOT NULL. O Postgres só infere um índice de
-                # arbitragem para ON CONFLICT quando a lista de colunas bate
-                # exatamente com as expressões do índice (erro 42P10 confirmado
-                # contra o Cloud SQL real deste tenant ao usar os nomes de coluna
-                # nus, como o brief especificava) — por isso replicamos aqui as
-                # mesmas expressões COALESCE do índice.
-                on_conflict=(
-                    "garantia_id, cnpj_credenciadora, COALESCE(documento_ufr, ''), "
-                    "COALESCE(documento_titular, ''), codigo_arranjo, data_liquidacao, origem"
-                ),
-            ).execute()
+                if not garantias.data:
+                    logger.warning(
+                        "[Processor] garantia referencia_externa=%s não encontrada no contrato %s — UR ignorada",
+                        referencia_garantia, contrato["id"],
+                    )
+                    continue
+                ur["garantia_id"] = garantias.data[0]["id"]
+                db.table("garantia_ur").upsert(
+                    ur,
+                    # NOTA (desvio do brief): a PK original de garantia_ur foi substituída
+                    # em sql/schema/02-contratos-schema-fixes.sql por um id BIGSERIAL + um
+                    # índice único FUNCIONAL (garantia_ur_natural_key) que envolve
+                    # documento_ufr/documento_titular em COALESCE(..., '') — necessário
+                    # porque a SPEC-02 §4.4 marca os dois como opcionais e a PK antiga os
+                    # tornava implicitamente NOT NULL. O Postgres só infere um índice de
+                    # arbitragem para ON CONFLICT quando a lista de colunas bate
+                    # exatamente com as expressões do índice (erro 42P10 confirmado
+                    # contra o Cloud SQL real deste tenant ao usar os nomes de coluna
+                    # nus, como o brief especificava) — por isso replicamos aqui as
+                    # mesmas expressões COALESCE do índice.
+                    on_conflict=(
+                        "garantia_id, cnpj_credenciadora, COALESCE(documento_ufr, ''), "
+                        "COALESCE(documento_titular, ''), codigo_arranjo, data_liquidacao, origem"
+                    ),
+                ).execute()
 
-        for indicador in indicadores_do_evento(evento, snapshot_em):
-            indicador["contrato_id"] = contrato["id"]
-            db.table("indicador_consistencia").upsert(
-                indicador, on_conflict="contrato_id, indicador, observado_em",
-            ).execute()
+            for indicador in indicadores_do_evento(evento, snapshot_em):
+                indicador["contrato_id"] = contrato["id"]
+                db.table("indicador_consistencia").upsert(
+                    indicador, on_conflict="contrato_id, indicador, observado_em",
+                ).execute()
 
-        if state_machine.eh_subgarantido(evento.get("resultadoDistribuicaoOnus")):
-            db.table("contrato_evento").insert({
-                "contrato_id": contrato["id"], "tipo": "ContratoSubgarantido",
-                "payload": evento, "ocorrido_em": snapshot_em,
-            }).execute()
+            if state_machine.eh_subgarantido(evento.get("resultadoDistribuicaoOnus")):
+                db.table("contrato_evento").insert({
+                    "contrato_id": contrato["id"], "tipo": "ContratoSubgarantido",
+                    "payload": evento, "ocorrido_em": snapshot_em,
+                }).execute()
 
-    db.table("contrato_evento").insert({
-        "contrato_id": contrato["id"], "tipo": "webhook_recebido",
-        "payload": payload, "ocorrido_em": datetime.now(timezone.utc),
-    }).execute()
+        # UPDATE de `contrato` é a ÚLTIMA escrita de domínio de propósito (não a
+        # primeira, como era antes): se o processo morrer entre as escritas
+        # acima e esta aqui, uma reentrega do Pub/Sub ainda vê contrato.status
+        # no valor ANTIGO (ex.: AGUARDANDO_WEBHOOK), então estado_apos_webhook
+        # segue funcionando normalmente na nova tentativa, e os upserts de
+        # garantia_ur/indicador_consistencia acima são idempotentes (chave
+        # derivada do próprio evento, não wall-clock). Com a ordem antiga
+        # (contrato primeiro), a mesma falha deixava o contrato marcado
+        # REGISTRADO/REJEITADO permanentemente sem nenhuma UR/indicador/evento
+        # de subgarantia — perda de dado silenciosa e permanente.
+        db.table("contrato").update(atualizacoes).eq("id", contrato["id"]).execute()
+
+        db.table("contrato_evento").insert({
+            "contrato_id": contrato["id"], "tipo": "webhook_recebido",
+            "payload": payload, "ocorrido_em": datetime.now(timezone.utc),
+        }).execute()
+    except Exception as exc:
+        logger.exception(
+            "[Processor] Falha inesperada processando webhook_inbox_id=%s (financiador=%s) — colocando em quarentena",
+            webhook_inbox_id, financiador_id,
+        )
+        db.table("webhook_inbox").update({
+            "processado_em": datetime.now(timezone.utc), "erro": repr(exc),
+        }).eq("id", webhook_inbox_id).execute()
+        return JsonResponse({}, status=204)
 
     db.table("webhook_inbox").update({"processado_em": datetime.now(timezone.utc)}).eq("id", webhook_inbox_id).execute()
 

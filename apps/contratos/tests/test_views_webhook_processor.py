@@ -152,9 +152,21 @@ def test_processor_envelope_pubsub_malformado_retorna_400():
     assert response.status_code == 400
 
 
-def test_processor_webhook_inbox_nao_encontrado_retorna_404():
+def test_processor_webhook_inbox_nao_encontrado_retorna_204():
+    # Condição permanentemente irrecuperável (a linha nunca vai aparecer) —
+    # confirma a entrega (204) em vez de deixar o Pub/Sub reentregar
+    # indefinidamente algo que retry nenhum pode consertar.
     response = Client().post(URL, data=_push_envelope("id-inexistente"), content_type="application/json")
-    assert response.status_code == 404
+    assert response.status_code == 204
+
+
+def test_processor_financiador_id_desconhecido_retorna_400():
+    # Tenant sem config resolvível (TENANT_..._CONFIG_CONTRATOS ausente) —
+    # mesmo tratamento que um envelope malformado: 400, não um 500 não tratado.
+    response = Client().post(
+        URL, data=_push_envelope("qualquer-id", financiador_id="00000000000000"), content_type="application/json",
+    )
+    assert response.status_code == 400
 
 
 def test_processor_ja_processado_e_idempotente():
@@ -173,7 +185,12 @@ def test_processor_contrato_nao_encontrado_retorna_500():
         assert response.status_code == 500
 
         linha = get_db(FINANCIADOR_TESTE).table("webhook_inbox").select("*").eq("id", webhook_id).execute()
-        assert linha.data[0]["processado_em"] is None  # deixado para nova entrega do Pub/Sub
+        # processado_em fica intacto (pode ser transitório, deixado para nova
+        # entrega do Pub/Sub), mas `erro` é preenchido como pista de diagnóstico
+        # — sem isso, a linha travada só seria visível vasculhando logs.
+        assert linha.data[0]["processado_em"] is None
+        assert linha.data[0]["erro"] is not None
+        assert "CTR-TESTE-PROC-SEMCONTRATO" in linha.data[0]["erro"]
     finally:
         _limpar(webhook_inbox_id=webhook_id)
 
@@ -275,3 +292,86 @@ def test_processor_tipo_evento_diferente_de_contrato_e_ignorado_mas_marcado_proc
         assert linha_inbox.data[0]["processado_em"] is not None
     finally:
         _limpar(webhook_inbox_id=webhook_id)
+
+
+def test_processor_reordenacao_urs_e_indicadores_sobrevivem_a_falha_no_update_do_contrato(monkeypatch):
+    """Prova direta do Finding 1: o UPDATE de `contrato` é a última escrita de
+    domínio agora, não a primeira. Simula um "crash" bem no UPDATE de contrato
+    (forçando uma exceção só nessa chamada específica) e confirma que, quando
+    isso acontece, garantia_ur e indicador_consistencia JÁ estão persistidos
+    (porque a nova ordem os escreve ANTES do contrato) — com a ordem antiga,
+    essa mesma falha teria deixado o contrato sem nenhum dado de garantia."""
+    from shared.cloudsql_client import QueryBuilder
+
+    referencia_externa = "CTR-TESTE-PROC-REORDER"
+    referencia_garantia = "CTR-TESTE-PROC-REORDER-G1"
+    contrato_id = _criar_contrato("AGUARDANDO_WEBHOOK", referencia_externa)
+    garantia_id = _criar_garantia(contrato_id, referencia_garantia)
+    webhook_id = _criar_webhook_inbox(_envelope_sucesso(referencia_externa, referencia_garantia, resultado="1"))
+
+    original_execute = QueryBuilder.execute
+
+    def _execute_simulando_crash_no_update_contrato(self):
+        if self._table == "contrato" and self._op == "update":
+            raise RuntimeError("crash simulado no meio do processamento")
+        return original_execute(self)
+
+    monkeypatch.setattr(QueryBuilder, "execute", _execute_simulando_crash_no_update_contrato)
+
+    try:
+        response = Client().post(URL, data=_push_envelope(webhook_id), content_type="application/json")
+        # quarentena (Finding 4), não um 500 solto
+        assert response.status_code == 204
+
+        db = get_db(FINANCIADOR_TESTE)
+        contrato = db.table("contrato").select("*").eq("id", contrato_id).execute().data[0]
+        # o UPDATE de contrato nunca completou — status permanece o de origem,
+        # não REGISTRADO. Numa reentrega do Pub/Sub, estado_apos_webhook ainda
+        # funciona normalmente a partir daqui (não levanta EstadoInvalidoError).
+        assert contrato["status"] == "AGUARDANDO_WEBHOOK"
+
+        # mas garantia_ur e indicador_consistencia JÁ foram persistidos — a
+        # nova ordem os escreve antes do UPDATE de contrato, então não se
+        # perdem quando o "crash" acontece no UPDATE.
+        urs = db.table("garantia_ur").select("*").eq("garantia_id", garantia_id).execute()
+        assert len(urs.data) == 1
+        assert urs.data[0]["cnpj_credenciadora"] == "11111111000111"
+
+        indicadores = db.table("indicador_consistencia").select("*").eq("contrato_id", contrato_id).execute()
+        assert len(indicadores.data) == 1
+
+        linha_inbox = db.table("webhook_inbox").select("*").eq("id", webhook_id).execute()
+        assert linha_inbox.data[0]["processado_em"] is not None
+        assert linha_inbox.data[0]["erro"] is not None
+    finally:
+        _limpar(contrato_id=contrato_id, garantia_id=garantia_id, webhook_inbox_id=webhook_id)
+
+
+def test_processor_evento_malformado_e_colocado_em_quarentena():
+    """Finding 4: resultadoDistribuicaoOnus fora de {0,1,2,3} faz
+    state_machine.sub_estado_garantia levantar ValueError dentro de
+    atualizacoes_contrato_do_evento — deve ser colocado em quarentena
+    (processado_em + erro setados, 204), não propagar como 500 e deixar o
+    Pub/Sub martelando o endpoint com a mesma mensagem poison-pill."""
+    referencia_externa = "CTR-TESTE-PROC-MALFORMADO"
+    referencia_garantia = "CTR-TESTE-PROC-MALFORMADO-G1"
+    contrato_id = _criar_contrato("AGUARDANDO_WEBHOOK", referencia_externa)
+    garantia_id = _criar_garantia(contrato_id, referencia_garantia)
+    envelope = _envelope_sucesso(referencia_externa, referencia_garantia, resultado="9")  # inválido
+    webhook_id = _criar_webhook_inbox(envelope)
+    try:
+        response = Client().post(URL, data=_push_envelope(webhook_id), content_type="application/json")
+        assert response.status_code == 204
+
+        db = get_db(FINANCIADOR_TESTE)
+        contrato = db.table("contrato").select("*").eq("id", contrato_id).execute().data[0]
+        assert contrato["status"] == "AGUARDANDO_WEBHOOK"  # nada foi escrito
+
+        urs = db.table("garantia_ur").select("*").eq("garantia_id", garantia_id).execute()
+        assert len(urs.data) == 0
+
+        linha_inbox = db.table("webhook_inbox").select("*").eq("id", webhook_id).execute()
+        assert linha_inbox.data[0]["processado_em"] is not None
+        assert linha_inbox.data[0]["erro"] is not None
+    finally:
+        _limpar(contrato_id=contrato_id, garantia_id=garantia_id, webhook_inbox_id=webhook_id)
