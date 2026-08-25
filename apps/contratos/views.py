@@ -66,8 +66,13 @@ def _autenticado(request, financiador_id: str) -> bool:
         logger.error("[Webhook] Credenciais Basic não configuradas para o tenant %s", financiador_id)
         return False
 
-    ok_usuario = hmac.compare_digest(usuario, usuario_esperado)
-    ok_senha = hmac.compare_digest(senha, senha_esperada)
+    # bytes, não str: hmac.compare_digest recusa comparar str com
+    # caracteres não-ASCII (levanta TypeError) — usuario/senha vêm de
+    # base64.b64decode(...).decode("utf-8") sobre entrada controlada pelo
+    # chamador externo, então qualquer credencial UTF-8 válida porém não-ASCII
+    # precisa continuar caindo em 401, não num 500 não tratado.
+    ok_usuario = hmac.compare_digest(usuario.encode("utf-8"), usuario_esperado.encode("utf-8"))
+    ok_senha = hmac.compare_digest(senha.encode("utf-8"), senha_esperada.encode("utf-8"))
     return ok_usuario and ok_senha
 
 

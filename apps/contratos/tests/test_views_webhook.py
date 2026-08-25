@@ -84,6 +84,22 @@ def test_webhook_credenciais_vazias_configuradas_retorna_401(monkeypatch, public
     assert publicados == []
 
 
+def test_webhook_credenciais_nao_ascii_retorna_401_sem_500(publicados):
+    """Regressão pós-revisão final: hmac.compare_digest recusa comparar str
+    com caracteres não-ASCII (levanta TypeError). usuario/senha vêm de
+    base64.b64decode(...).decode("utf-8") sobre entrada do chamador externo,
+    então uma credencial UTF-8 válida porém não-ASCII precisa continuar
+    caindo em 401 — não pode reintroduzir um 500 não tratado no caminho de
+    autenticação."""
+    header_nao_ascii = "Basic " + base64.b64encode("usuário:senhaç".encode("utf-8")).decode()
+    response = Client().post(
+        URL, data=json.dumps(_envelope("CTR-TESTE-WEBHOOK-NAOASCII")), content_type="application/json",
+        HTTP_AUTHORIZATION=header_nao_ascii,
+    )
+    assert response.status_code == 401
+    assert publicados == []
+
+
 def test_webhook_falha_nao_runtimeerror_ao_resolver_tenant_retorna_401(monkeypatch, publicados):
     """Achado importante da revisão final: em produção (Secret Manager), uma
     falha ao resolver a config do tenant pode levantar algo diferente de
