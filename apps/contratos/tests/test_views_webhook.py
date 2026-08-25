@@ -3,7 +3,9 @@ import json
 
 import pytest
 from django.test import Client
+from sqlalchemy.exc import DBAPIError
 
+from apps.contratos import views
 from apps.contratos.webhook_dedupe import hash_evento
 from shared import pubsub_client
 from shared.cloudsql_client import get_db
@@ -121,6 +123,52 @@ def test_webhook_duplicado_nao_gera_segunda_linha_nem_publica_de_novo(publicados
         salvos = get_db(FINANCIADOR_TESTE).table("webhook_inbox").select("*").eq("hash_dedupe", h).execute()
         assert len(salvos.data) == 1
         assert len(publicados) == 1
+    finally:
+        _limpar(envelope)
+
+
+def test_webhook_falha_de_banco_nao_duplicada_retorna_500(monkeypatch, publicados):
+    """Cobre o ramo `except DBAPIError` quando `_violacao_unique` retorna
+    False — um erro de banco genuíno (ex.: not_null_violation, sqlstate
+    23502), não uma reentrega duplicada. Precisa responder 500 (não 202)
+    e não deve persistir nada nem publicar, provando que esse ramo não é
+    confundido com o caminho de sucesso/duplicado."""
+    envelope = _envelope("CTR-TESTE-WEBHOOK-DBFAIL")
+    _limpar(envelope)
+
+    class _ExecuteFalha:
+        def execute(self):
+            orig = Exception("not_null_violation")
+            # Mesmo formato que `_violacao_unique` espera em erro.orig.args[0]
+            # (dict de campos da mensagem de erro do Postgres), mas com um
+            # sqlstate que NÃO é 23505 (unique_violation) — aqui, 23502
+            # (not_null_violation) — para forçar o ramo "não é duplicado".
+            orig.args = ({"C": "23502", "M": "null value in column violates not-null constraint"},)
+            raise DBAPIError("INSERT INTO webhook_inbox ...", {}, orig)
+
+    class _TabelaFalha:
+        def insert(self, data):
+            return _ExecuteFalha()
+
+    class _DbFalha:
+        def table(self, nome):
+            assert nome == "webhook_inbox"
+            return _TabelaFalha()
+
+    monkeypatch.setattr(views, "get_db", lambda financiador_id: _DbFalha())
+
+    try:
+        response = Client().post(
+            URL, data=json.dumps(envelope), content_type="application/json",
+            HTTP_AUTHORIZATION=_basic_auth_header(),
+        )
+        assert response.status_code == 500
+
+        h = hash_evento(envelope["tipoEvento"], envelope["evento"], envelope["dataHoraEvento"])
+        salvo = get_db(FINANCIADOR_TESTE).table("webhook_inbox").select("*").eq("hash_dedupe", h).execute()
+        assert len(salvo.data) == 0  # nada foi persistido de verdade — não é o caminho de duplicado/sucesso
+
+        assert publicados == []  # não deveria ter chegado perto de publicar
     finally:
         _limpar(envelope)
 
