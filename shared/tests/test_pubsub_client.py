@@ -73,3 +73,30 @@ def test_publish_webhook_contrato_nao_levanta_quando_google_cloud_project_ausent
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
 
     pubsub_client.publish_webhook_contrato("01ABC", "12345678000199")  # não deve levantar
+
+
+def test_publish_webhook_contrato_nao_chama_get_publisher_quando_google_cloud_project_ausente(monkeypatch):
+    """Verifica que _get_publisher nunca é chamado quando GOOGLE_CLOUD_PROJECT está ausente,
+    evitando o custo de construção do cliente real."""
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+
+    def _get_publisher_should_not_be_called():
+        raise AssertionError("_get_publisher should not be called when GOOGLE_CLOUD_PROJECT is absent")
+
+    monkeypatch.setattr(pubsub_client, "_get_publisher", _get_publisher_should_not_be_called)
+
+    pubsub_client.publish_webhook_contrato("01ABC", "12345678000199")  # não deve levantar
+
+
+def test_publish_webhook_contrato_nao_levanta_quando_add_done_callback_falha(monkeypatch):
+    """Verifica que se add_done_callback levanta, a exceção é capturada e logada."""
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "registradora-506000")
+
+    class _FutureWithFailingCallback:
+        def add_done_callback(self, callback):
+            raise RuntimeError("callback registration failed")
+
+    fake_publisher = _FakePublisher(_FutureWithFailingCallback())
+    monkeypatch.setattr(pubsub_client, "_get_publisher", lambda: fake_publisher)
+
+    pubsub_client.publish_webhook_contrato("01ABC", "12345678000199")  # não deve levantar

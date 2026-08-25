@@ -37,15 +37,15 @@ def publish_webhook_contrato(webhook_inbox_id: str, financiador_id: str) -> None
     evento completo em webhook_inbox pelo id; a mensagem em si fica pequena
     e o payload nunca vive em dois lugares."""
     try:
+        topic = _topic_path()
         data = json.dumps({
             "webhook_inbox_id": webhook_inbox_id,
             "financiador_id": financiador_id,
         }).encode("utf-8")
-        future = _get_publisher().publish(_topic_path(), data)
+        future = _get_publisher().publish(topic, data)
+        future.add_done_callback(lambda f: _log_publish_result(f, webhook_inbox_id))
     except Exception:
         logger.exception("[Pub/Sub] Falha ao publicar webhook_inbox_id=%s", webhook_inbox_id)
-        return
-    future.add_done_callback(lambda f: _log_publish_result(f, webhook_inbox_id))
 
 
 def _log_publish_result(future, webhook_inbox_id: str) -> None:
