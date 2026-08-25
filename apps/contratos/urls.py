@@ -1,7 +1,7 @@
-from django.urls import path
+from django.urls import path, re_path
 from . import views
 
 urlpatterns = [
     path("health", views.health),
-    path("webhooks/contrato/<str:financiador_id>", views.webhook_contrato),
+    re_path(r"^webhooks/contrato/(?P<financiador_id>\d{14})$", views.webhook_contrato),
 ]

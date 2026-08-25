@@ -1,4 +1,5 @@
 import base64
+import hmac
 import json
 import logging
 from datetime import datetime
@@ -46,11 +47,28 @@ def _autenticado(request, financiador_id: str) -> bool:
 
     try:
         config = get_tenant_config(financiador_id)
-    except RuntimeError:
-        # financiador_id sem segredo configurado — trata como credencial
-        # inválida, não como 404/500 (não vazamos se o tenant existe).
+    except Exception:
+        # Qualquer falha ao resolver a config do tenant — env var ausente em
+        # dev (RuntimeError), NotFound/PermissionDenied/InvalidArgument do
+        # Secret Manager em produção, ou qualquer outra causa — significa
+        # "essas credenciais não autenticam aqui". Trata como credencial
+        # inválida, não como 404/500 (não vazamos se o tenant existe nem
+        # detalhes da falha subjacente ao chamador).
         return False
-    return usuario == config.get("webhook_basic_user") and senha == config.get("webhook_basic_password")
+
+    usuario_esperado = config.get("webhook_basic_user")
+    senha_esperada = config.get("webhook_basic_password")
+    if not usuario_esperado or not senha_esperada:
+        # Config do tenant com credenciais vazias (ex.: placeholder do
+        # .env.example nunca substituído) — nunca trata como "autentica
+        # qualquer um". Loga para tornar o tenant mal configurado visível
+        # em produção, mas não vaza isso na resposta ao chamador externo.
+        logger.error("[Webhook] Credenciais Basic não configuradas para o tenant %s", financiador_id)
+        return False
+
+    ok_usuario = hmac.compare_digest(usuario, usuario_esperado)
+    ok_senha = hmac.compare_digest(senha, senha_esperada)
+    return ok_usuario and ok_senha
 
 
 @require_POST

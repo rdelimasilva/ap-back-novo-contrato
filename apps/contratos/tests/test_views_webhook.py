@@ -65,6 +65,44 @@ def test_webhook_tenant_desconhecido_retorna_401(publicados):
     assert response.status_code == 401
 
 
+def test_webhook_credenciais_vazias_configuradas_retorna_401(monkeypatch, publicados):
+    """Achado crítico da revisão final: se a config do tenant tem
+    webhook_basic_user/webhook_basic_password vazios (ex.: placeholder do
+    .env.example nunca substituído), uma requisição com usuário/senha
+    vazios (Basic de ':') NÃO deve autenticar — antes desse fix,
+    "" == "" passava e qualquer chamador era autenticado."""
+    monkeypatch.setattr(
+        views, "get_tenant_config",
+        lambda financiador_id: {"webhook_basic_user": "", "webhook_basic_password": ""},
+    )
+    header_vazio = "Basic " + base64.b64encode(b":").decode()
+    response = Client().post(
+        URL, data=json.dumps(_envelope("CTR-TESTE-WEBHOOK-CREDVAZIA")), content_type="application/json",
+        HTTP_AUTHORIZATION=header_vazio,
+    )
+    assert response.status_code == 401
+    assert publicados == []
+
+
+def test_webhook_falha_nao_runtimeerror_ao_resolver_tenant_retorna_401(monkeypatch, publicados):
+    """Achado importante da revisão final: em produção (Secret Manager), uma
+    falha ao resolver a config do tenant pode levantar algo diferente de
+    RuntimeError (ex.: NotFound/PermissionDenied do google.api_core). O
+    catch em `_autenticado` precisa cobrir isso e responder 401, não deixar
+    a exceção subir como 500."""
+
+    def _falha(financiador_id):
+        raise ValueError("simulated non-RuntimeError failure")
+
+    monkeypatch.setattr(views, "get_tenant_config", _falha)
+    response = Client().post(
+        URL, data=json.dumps(_envelope("CTR-TESTE-WEBHOOK-NAORUNTIME")), content_type="application/json",
+        HTTP_AUTHORIZATION=_basic_auth_header(),
+    )
+    assert response.status_code == 401
+    assert publicados == []
+
+
 def test_webhook_get_retorna_405():
     response = Client().get(URL)
     assert response.status_code == 405
