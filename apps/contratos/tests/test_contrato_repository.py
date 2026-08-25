@@ -131,3 +131,23 @@ def test_inserir_contrato_criado_sem_anteriores_nem_parcelas_nao_gera_linhas():
         assert parcelas.data == []
     finally:
         _limpar(referencia_externa)
+
+
+def test_inserir_contrato_criado_garantia_sem_domicilio_nao_gera_linha_de_domicilio():
+    referencia_externa = "CTR-TESTE-REPO-SEM-DOMICILIO"
+    _limpar(referencia_externa)
+    try:
+        payload = _payload_validado(referencia_externa, com_domicilio=False)
+        contrato = inserir_contrato_criado(
+            FINANCIADOR_TESTE, payload, status="AGUARDANDO_WEBHOOK", protocolo="proto-3", id_contrato_cerc=None,
+        )
+
+        db = get_db(FINANCIADOR_TESTE)
+        domicilio = db.table("contrato_domicilio").select("*").eq("contrato_id", contrato["id"]).execute()
+        assert domicilio.data == []
+
+        garantias = db.table("garantia").select("*").eq("contrato_id", contrato["id"]).execute()
+        assert len(garantias.data) == 1
+        assert garantias.data[0]["referencia_externa"] == f"{referencia_externa}-G1"
+    finally:
+        _limpar(referencia_externa)
