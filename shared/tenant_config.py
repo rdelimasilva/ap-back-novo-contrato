@@ -13,7 +13,11 @@ credenciais CERC" já adotado), evitando colisão de nome no Secret Manager.
 
 Chaves esperadas no JSON: cloudsql_connection_name, cloudsql_db_user,
 cloudsql_db_password, cloudsql_db_name, cloudsql_ip_type (opcional,
-default "PUBLIC"), cerc_client_id, cerc_client_secret.
+default "PUBLIC"), cerc_client_id, cerc_client_secret,
+webhook_basic_user, webhook_basic_password (credenciais que esperamos que
+a CERC envie via HTTP Basic Auth ao chamar nosso webhook — escolhido
+porque a SPEC-01 §4.4 permite OAuth2 ou Basic no sentido CERC→nós, e
+Basic não exige infraestrutura de emissão de token do nosso lado).
 
 Ver docs/superpowers/specs/2026-08-24-contratos-service-design.md §1.1.
 """
