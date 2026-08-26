@@ -5,7 +5,7 @@ Funções puras — nenhuma chamada a banco/CERC. Quem persiste uma transição
 funções primeiro e só então grava o resultado; este módulo nunca toca
 `contrato`/`garantia_ur`/`cerc_requisicao` diretamente.
 
-Diagrama (§8):
+Diagrama (§8, com uma correção do Plano 13 — ver abaixo):
 
     PUT /v15/contratos (C)
               |
@@ -21,18 +21,27 @@ AGUARDANDO_WEBHOOK   REJEITADO_ESTRUTURAL
 webhook    webhook       timeout SLA          (op = A)
 status=0   status=1      (sem webhook)             |
     |           |              |                    v
-    v           v              v              ATUALIZANDO --> REGISTRADO
+    v           v              v              ATUALIZANDO -> (webhook) -> REGISTRADO | REJEITADO
 REGISTRADO  REJEITADO   PENDENTE_CONCILIACAO
     |
-    +-- op I --> INATIVADO
-    +-- op B --> BAIXADO
-    +-- op P --> RESILIDO_PARCIAL
-    +-- op R --> RESILIDO_TOTAL
+    +-- op I --> INATIVANDO        -> (webhook) -> INATIVADO        | REGISTRADO
+    +-- op B --> BAIXANDO          -> (webhook) -> BAIXADO          | REGISTRADO
+    +-- op P --> RESILINDO_PARCIAL -> (webhook) -> RESILIDO_PARCIAL | REGISTRADO
+    +-- op R --> RESILINDO_TOTAL   -> (webhook) -> RESILIDO_TOTAL   | REGISTRADO
+
+Correção do Plano 13: a SPEC-02 §8 desenha "op I/B/P/R" indo direto de
+REGISTRADO pro estado terminal, sem espera — mas isso contradiz a regra
+central da §0 ("nenhuma operação é definitiva antes da confirmação
+assíncrona"). Decisão confirmada com o usuário (não assumida): operações
+pós-registro esperam o webhook igual à atualização (op=A) já espera hoje.
+Uma falha na confirmação NÃO rejeita o contrato original (ele já estava
+REGISTRADO antes da tentativa) — volta pra REGISTRADO, só a operação
+específica não se efetivou.
 
 O SLA em si (30min pra PENDENTE_CONCILIACAO, alerta após 2h) não é
 responsabilidade deste módulo — ele só responde "qual o próximo estado
 quando um timeout acontece", não "quanto tempo já passou". Isso é do
-job de reconciliação (Plano 11), que é quem sabe a hora real.
+job de reconciliação (Plano futuro), que é quem sabe a hora real.
 """
 
 ENVIANDO = "ENVIANDO"
@@ -42,6 +51,10 @@ REGISTRADO = "REGISTRADO"
 REJEITADO = "REJEITADO"
 PENDENTE_CONCILIACAO = "PENDENTE_CONCILIACAO"
 ATUALIZANDO = "ATUALIZANDO"
+INATIVANDO = "INATIVANDO"
+BAIXANDO = "BAIXANDO"
+RESILINDO_PARCIAL = "RESILINDO_PARCIAL"
+RESILINDO_TOTAL = "RESILINDO_TOTAL"
 INATIVADO = "INATIVADO"
 BAIXADO = "BAIXADO"
 RESILIDO_PARCIAL = "RESILIDO_PARCIAL"
@@ -49,6 +62,10 @@ RESILIDO_TOTAL = "RESILIDO_TOTAL"
 
 ESTADOS_TERMINAIS = {
     REJEITADO_ESTRUTURAL, REJEITADO, INATIVADO, BAIXADO, RESILIDO_PARCIAL, RESILIDO_TOTAL,
+}
+
+ESTADOS_AGUARDANDO_WEBHOOK = {
+    AGUARDANDO_WEBHOOK, ATUALIZANDO, INATIVANDO, BAIXANDO, RESILINDO_PARCIAL, RESILINDO_TOTAL,
 }
 
 NAO_APLICAVEL = "NAO_APLICAVEL"
@@ -80,37 +97,63 @@ def estado_apos_400() -> str:
     return REJEITADO_ESTRUTURAL
 
 
+_TRANSICOES_WEBHOOK = {
+    AGUARDANDO_WEBHOOK: (REGISTRADO, REJEITADO),
+    ATUALIZANDO: (REGISTRADO, REJEITADO),
+    INATIVANDO: (INATIVADO, REGISTRADO),
+    BAIXANDO: (BAIXADO, REGISTRADO),
+    RESILINDO_PARCIAL: (RESILIDO_PARCIAL, REGISTRADO),
+    RESILINDO_TOTAL: (RESILIDO_TOTAL, REGISTRADO),
+}
+
+
 def estado_apos_webhook(estado_atual: str, status_webhook: str) -> str:
-    """§8: webhook status=0 -> REGISTRADO (a partir de AGUARDANDO_WEBHOOK ou
-    ATUALIZANDO); status=1 -> REJEITADO."""
-    if estado_atual not in (AGUARDANDO_WEBHOOK, ATUALIZANDO):
+    """§8: webhook status=0 -> sucesso; status=1 -> falha. O par
+    (sucesso, falha) depende de QUAL espera está sendo resolvida — carregado
+    no próprio `estado_atual`, então o caller nunca precisa saber qual
+    tipoOperacao originou a espera (Plano 11's webhook processor não precisa
+    de nenhuma mudança por causa disso — ver design do Plano 13).
+
+    Para criação/atualização (AGUARDANDO_WEBHOOK/ATUALIZANDO), uma falha
+    derruba pra REJEITADO — o registro nunca existiu de verdade. Para
+    operações pós-registro (INATIVANDO/BAIXANDO/RESILINDO_*), uma falha NÃO
+    rejeita o contrato — ele já estava REGISTRADO antes da tentativa, então
+    volta pra REGISTRADO; só a operação específica não se efetivou."""
+    try:
+        sucesso, falha = _TRANSICOES_WEBHOOK[estado_atual]
+    except KeyError:
         raise EstadoInvalidoError(estado_atual, f"webhook (status={status_webhook})")
-    return REGISTRADO if status_webhook == "0" else REJEITADO
+    return sucesso if status_webhook == "0" else falha
 
 
 def estado_apos_timeout_sla(estado_atual: str) -> str:
-    """§8: nenhum webhook em 30min (configurável) -> PENDENTE_CONCILIACAO."""
-    if estado_atual not in (AGUARDANDO_WEBHOOK, ATUALIZANDO):
+    """§8: nenhum webhook em 30min (configurável) -> PENDENTE_CONCILIACAO,
+    de qualquer um dos estados de espera (criação, atualização ou operação
+    pós-registro — o timeout não distingue qual)."""
+    if estado_atual not in ESTADOS_AGUARDANDO_WEBHOOK:
         raise EstadoInvalidoError(estado_atual, "timeout SLA")
     return PENDENTE_CONCILIACAO
 
 
-_OPERACAO_PARA_ESTADO_POS_REGISTRO = {
-    "I": INATIVADO,
-    "B": BAIXADO,
-    "P": RESILIDO_PARCIAL,
-    "R": RESILIDO_TOTAL,
+_OPERACAO_PARA_ESTADO_ESPERA = {
+    "I": INATIVANDO,
+    "B": BAIXANDO,
+    "P": RESILINDO_PARCIAL,
+    "R": RESILINDO_TOTAL,
 }
 
 
 def estado_apos_operacao_pos_registro(estado_atual: str, tipo_operacao: str) -> str:
-    """§8: a partir de REGISTRADO, tipoOperacao I/B/P/R leva a um estado
-    terminal específico."""
+    """§8: a partir de REGISTRADO, tipoOperacao I/B/P/R entra num estado de
+    ESPERA pelo webhook que confirma a operação — mesmo raciocínio de
+    ATUALIZANDO: nenhuma operação pós-registro é definitiva antes da
+    confirmação assíncrona (SPEC-02 §0, decisão confirmada no Plano 13).
+    Não retorna mais o estado terminal diretamente."""
     if estado_atual != REGISTRADO:
         raise EstadoInvalidoError(estado_atual, f"operação {tipo_operacao}")
-    if tipo_operacao not in _OPERACAO_PARA_ESTADO_POS_REGISTRO:
+    if tipo_operacao not in _OPERACAO_PARA_ESTADO_ESPERA:
         raise ValueError(f"tipoOperacao '{tipo_operacao}' não leva a um estado pós-registro")
-    return _OPERACAO_PARA_ESTADO_POS_REGISTRO[tipo_operacao]
+    return _OPERACAO_PARA_ESTADO_ESPERA[tipo_operacao]
 
 
 _RESULTADO_PARA_SUBESTADO = {

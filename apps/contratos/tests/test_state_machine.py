@@ -35,15 +35,51 @@ def test_estado_apos_webhook_falha_vai_para_rejeitado():
     assert sm.estado_apos_webhook(sm.AGUARDANDO_WEBHOOK, status_webhook="1") == sm.REJEITADO
 
 
+def test_estado_apos_webhook_falha_de_atualizando_vai_para_rejeitado():
+    assert sm.estado_apos_webhook(sm.ATUALIZANDO, status_webhook="1") == sm.REJEITADO
+
+
 def test_estado_apos_webhook_de_estado_nao_esperado_levanta_erro():
     with pytest.raises(sm.EstadoInvalidoError):
         sm.estado_apos_webhook(sm.REGISTRADO, status_webhook="0")
 
 
-# timeout SLA -> PENDENTE_CONCILIACAO
+# INATIVANDO / BAIXANDO / RESILINDO_PARCIAL / RESILINDO_TOTAL -> (webhook) ->
+# terminal específico (sucesso) | REGISTRADO (falha — a operação pós-registro
+# não vingou, mas o contrato original continua registrado)
+
+@pytest.mark.parametrize("estado_espera,terminal_sucesso", [
+    (sm.INATIVANDO, sm.INATIVADO),
+    (sm.BAIXANDO, sm.BAIXADO),
+    (sm.RESILINDO_PARCIAL, sm.RESILIDO_PARCIAL),
+    (sm.RESILINDO_TOTAL, sm.RESILIDO_TOTAL),
+])
+def test_estado_apos_webhook_sucesso_de_operacao_pos_registro_vai_para_terminal(estado_espera, terminal_sucesso):
+    assert sm.estado_apos_webhook(estado_espera, status_webhook="0") == terminal_sucesso
+
+
+@pytest.mark.parametrize("estado_espera", [
+    sm.INATIVANDO, sm.BAIXANDO, sm.RESILINDO_PARCIAL, sm.RESILINDO_TOTAL,
+])
+def test_estado_apos_webhook_falha_de_operacao_pos_registro_volta_para_registrado(estado_espera):
+    assert sm.estado_apos_webhook(estado_espera, status_webhook="1") == sm.REGISTRADO
+
+
+# timeout SLA -> PENDENTE_CONCILIACAO (de qualquer estado de espera)
 
 def test_estado_apos_timeout_sla_de_aguardando_webhook():
     assert sm.estado_apos_timeout_sla(sm.AGUARDANDO_WEBHOOK) == sm.PENDENTE_CONCILIACAO
+
+
+def test_estado_apos_timeout_sla_de_atualizando():
+    assert sm.estado_apos_timeout_sla(sm.ATUALIZANDO) == sm.PENDENTE_CONCILIACAO
+
+
+@pytest.mark.parametrize("estado_espera", [
+    sm.INATIVANDO, sm.BAIXANDO, sm.RESILINDO_PARCIAL, sm.RESILINDO_TOTAL,
+])
+def test_estado_apos_timeout_sla_de_operacao_pos_registro(estado_espera):
+    assert sm.estado_apos_timeout_sla(estado_espera) == sm.PENDENTE_CONCILIACAO
 
 
 def test_estado_apos_timeout_sla_de_estado_nao_esperado_levanta_erro():
@@ -51,13 +87,15 @@ def test_estado_apos_timeout_sla_de_estado_nao_esperado_levanta_erro():
         sm.estado_apos_timeout_sla(sm.REGISTRADO)
 
 
-# REGISTRADO -> (op I/B/P/R) -> estado terminal específico
+# REGISTRADO -> (op I/B/P/R) -> estado de ESPERA (não mais terminal direto —
+# mudança deste plano: a operação pós-registro também espera o webhook,
+# igual à atualização)
 
 @pytest.mark.parametrize("tipo_operacao,esperado", [
-    ("I", "INATIVADO"),
-    ("B", "BAIXADO"),
-    ("P", "RESILIDO_PARCIAL"),
-    ("R", "RESILIDO_TOTAL"),
+    ("I", "INATIVANDO"),
+    ("B", "BAIXANDO"),
+    ("P", "RESILINDO_PARCIAL"),
+    ("R", "RESILINDO_TOTAL"),
 ])
 def test_estado_apos_operacao_pos_registro(tipo_operacao, esperado):
     assert sm.estado_apos_operacao_pos_registro(sm.REGISTRADO, tipo_operacao) == esperado
