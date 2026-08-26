@@ -177,3 +177,64 @@ def test_criar_contrato_erro_cerc_retorna_502():
         assert buscar_contrato_por_referencia(FINANCIADOR_TESTE, referencia_externa) is None
     finally:
         _limpar(referencia_externa)
+
+
+@respx.mock
+def test_criar_contrato_replay_de_contrato_rejeitado_estrutural_retorna_422_nao_202():
+    # Regressão (task review, rodada 1): o caminho de replay idempotente por
+    # referenciaExterna retornava 202 hardcoded mesmo quando o contrato já
+    # persistido estava REJEITADO_ESTRUTURAL — mismatch de status HTTP vs.
+    # corpo da resposta. Prova que uma segunda submissão para o MESMO
+    # referenciaExterna rejeitado também retorna 422 (não 202), e que a CERC
+    # não é chamada de novo no replay.
+    referencia_externa = "CTR-TESTE-VIEW-REJEITADO-REPLAY"
+    _limpar(referencia_externa)
+    try:
+        _mock_token()
+        rota = respx.put("https://ap-homolog.cerc.inf.br/v15/contratos").mock(
+            return_value=httpx.Response(207, json=[{
+                "referenciaExterna": referencia_externa, "protocolo": "proto-view-4",
+                "dataHoraProcessamento": "2026-08-25T12:00:00.000Z", "status": "1",
+                "erros": [{"codigo": "107501", "mensagem": "UFR sem vínculo"}],
+            }])
+        )
+
+        cliente = Client()
+        r1 = cliente.post(URL, data=json.dumps(_payload(referencia_externa)), content_type="application/json")
+        r2 = cliente.post(URL, data=json.dumps(_payload(referencia_externa)), content_type="application/json")
+
+        assert r1.status_code == 422
+        assert r2.status_code == 422
+        corpo2 = r2.json()
+        assert corpo2["status"] == "REJEITADO_ESTRUTURAL"
+        assert rota.call_count == 1  # replay não bate na CERC de novo
+    finally:
+        _limpar(referencia_externa)
+
+
+@respx.mock
+def test_criar_contrato_campo_obrigatorio_nivel_contrato_ausente_retorna_422_sem_chamar_cerc():
+    # Regressão (task review, rodada 1): identificacaoGestaoEntidadeRegistradora
+    # só era checado dentro do loop `for g in garantias`, que não roda quando
+    # garantias == [] (legítimo para repactuacao="1", C03) — o payload passava
+    # pela validação local inteira, era submetido à CERC de verdade, e só
+    # então explodia com KeyError não tratado ao persistir. Deliberadamente
+    # NÃO registra nenhuma rota respx para a CERC: se o código tentasse
+    # chamá-la mesmo assim, respx levantaria (nenhuma rota corresponde) e a
+    # asserção de 422 abaixo falharia — provando que a CERC nunca é chamada.
+    referencia_externa = "CTR-TESTE-VIEW-SEM-GESTAO"
+    _limpar(referencia_externa)
+    try:
+        payload = _payload(referencia_externa)
+        payload["garantias"] = []
+        payload["repactuacao"] = "1"
+        del payload["identificacaoGestaoEntidadeRegistradora"]
+
+        response = Client().post(URL, data=json.dumps(payload), content_type="application/json")
+
+        assert response.status_code == 422
+        corpo = response.json()
+        assert corpo["codigo"] == "CAMPO_OBRIGATORIO"
+        assert buscar_contrato_por_referencia(FINANCIADOR_TESTE, referencia_externa) is None
+    finally:
+        _limpar(referencia_externa)

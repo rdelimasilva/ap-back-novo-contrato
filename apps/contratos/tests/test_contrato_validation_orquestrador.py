@@ -207,3 +207,19 @@ def test_validar_criacao_contrato_c19_aceita_99t_mesmo_fora_do_dominio_sincroniz
     payload = _payload_valido()
     payload["garantias"][0]["definicaoUnidadeRecebivel"]["listaCodigoArranjoPagamento"] = ["99T"]
     validar_criacao_contrato(payload, hoje=HOJE, ativos_arranjos=set())  # nenhum arranjo sincronizado ainda — "99T" sempre aceito
+
+
+@pytest.mark.parametrize("campo_ausente", [
+    "referenciaExterna",
+    "identificadorContrato",
+    "cnpjDetentor",
+    "tipoEfeito",
+    "modalidadeOperacao",
+    "identificacaoGestaoEntidadeRegistradora",
+])
+def test_validar_criacao_contrato_campo_obrigatorio_nivel_contrato_ausente(campo_ausente):
+    payload = _payload_valido()
+    del payload[campo_ausente]
+    with pytest.raises(ValidationError) as exc:
+        validar_criacao_contrato(payload, hoje=HOJE, ativos_arranjos=ATIVOS_ARRANJOS)
+    assert exc.value.codigo == "CAMPO_OBRIGATORIO"

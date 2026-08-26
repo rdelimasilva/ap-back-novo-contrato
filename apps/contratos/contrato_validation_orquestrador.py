@@ -54,7 +54,37 @@ def _eh_raiz(documento) -> bool:
     return bool(documento) and tipo_documento(documento) == "CNPJ_RAIZ"
 
 
+# Campos de nível-contrato que apps.contratos.contrato_repository.inserir_contrato_criado
+# lê via acesso direto (payload_validado["..."]), mas que nenhum validador C0x cobre
+# incondicionalmente (alguns só são tocados dentro do loop `for g in garantias`, que não
+# roda quando garantias == [] — legítimo para repactuacao="1", C03). Sem este guard, um
+# payload faltando um destes passa pela validação local inteira, é submetido à CERC (uma
+# chamada externa real), e só então explode com KeyError não tratado ao persistir — depois
+# de já ter gasto a chamada à CERC. Checado aqui, primeiro, para que a falta de um destes
+# vire um 422 comum (mesmo caminho de qualquer outra violação de validação local), nunca
+# um 500 nem uma chamada à CERC desperdiçada.
+CAMPOS_OBRIGATORIOS_NIVEL_CONTRATO = (
+    "referenciaExterna", "identificadorContrato", "cnpjDetentor",
+    "tipoEfeito", "modalidadeOperacao", "identificacaoGestaoEntidadeRegistradora",
+)
+
+
+def _validar_campos_obrigatorios(payload: dict) -> None:
+    # `campo not in payload` (ausência da CHAVE), não um teste de "falsy" — o
+    # bug real é o KeyError de contrato_repository.inserir_contrato_criado
+    # (payload_validado["campo"]) quando a CHAVE nunca chegou no payload, não
+    # o valor estar vazio/None quando presente. Um teste "falsy" aqui
+    # quebraria test_validar_criacao_contrato_c18_bloqueio_judicial_sem_identificador
+    # (Tarefa 1, já mesclada), que passa identificadorContrato="" de propósito
+    # para exercitar C18 — esse "" é um valor de payload legítimo (a chave
+    # existe), não um payload malformado.
+    for campo in CAMPOS_OBRIGATORIOS_NIVEL_CONTRATO:
+        if campo not in payload:
+            raise ValidationError("CAMPO_OBRIGATORIO", f"'{campo}' é obrigatório")
+
+
 def validar_criacao_contrato(payload: dict, *, hoje: date, ativos_arranjos: set) -> dict:
+    _validar_campos_obrigatorios(payload)
     validar_c01_documento(payload["documentoContratante"])
     validar_c02_repactuacao(payload.get("repactuacao"), payload.get("identificacaoContratosAnteriores"))
     validar_c03_repactuacao_sem_garantias(payload.get("repactuacao"), payload.get("garantias"))

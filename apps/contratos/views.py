@@ -335,9 +335,10 @@ def criar_contrato(request, financiador_id: str):
     if referencia_externa:
         existente = buscar_contrato_por_referencia(financiador_id, referencia_externa)
         if existente:
+            status_http_replay = 202 if existente["status"] != state_machine.REJEITADO_ESTRUTURAL else 422
             return JsonResponse({
                 "id": existente["id"], "status": existente["status"], "referenciaExterna": referencia_externa,
-            }, status=202)
+            }, status=status_http_replay)
 
     db = get_db(financiador_id)
     ativos = db.table("dominio_arranjo").select("codigo").eq("ativo", True).execute()
