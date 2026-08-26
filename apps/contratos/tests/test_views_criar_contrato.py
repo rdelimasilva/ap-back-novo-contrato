@@ -180,34 +180,160 @@ def test_criar_contrato_erro_cerc_retorna_502():
 
 
 @respx.mock
-def test_criar_contrato_replay_de_contrato_rejeitado_estrutural_retorna_422_nao_202():
-    # Regressão (task review, rodada 1): o caminho de replay idempotente por
-    # referenciaExterna retornava 202 hardcoded mesmo quando o contrato já
-    # persistido estava REJEITADO_ESTRUTURAL — mismatch de status HTTP vs.
-    # corpo da resposta. Prova que uma segunda submissão para o MESMO
-    # referenciaExterna rejeitado também retorna 422 (não 202), e que a CERC
-    # não é chamada de novo no replay.
-    referencia_externa = "CTR-TESTE-VIEW-REJEITADO-REPLAY"
+def test_criar_contrato_resubmissao_de_rejeitado_estrutural_chama_cerc_de_novo_e_substitui_o_grafo():
+    # Revisão final, achados 1/2: antes, o replay idempotente curto-circuitava
+    # TAMBÉM para REJEITADO_ESTRUTURAL — um contrato recusado estruturalmente
+    # (que a CERC NUNCA registrou) ficava num beco sem saída permanente sob o
+    # mesmo referenciaExterna. Agora a ressubmissão é aceita: a CERC é chamada
+    # de novo, o grafo antigo é descartado e o novo é gravado com um id novo,
+    # sem violar UNIQUE (cnpj_participante, identificador_contrato).
+    referencia_externa = "CTR-TESTE-VIEW-REJEITADO-RETRY"
     _limpar(referencia_externa)
     try:
         _mock_token()
         rota = respx.put("https://ap-homolog.cerc.inf.br/v15/contratos").mock(
-            return_value=httpx.Response(207, json=[{
-                "referenciaExterna": referencia_externa, "protocolo": "proto-view-4",
-                "dataHoraProcessamento": "2026-08-25T12:00:00.000Z", "status": "1",
-                "erros": [{"codigo": "107501", "mensagem": "UFR sem vínculo"}],
-            }])
+            side_effect=[
+                httpx.Response(207, json=[{
+                    "referenciaExterna": referencia_externa, "protocolo": "proto-view-4a",
+                    "dataHoraProcessamento": "2026-08-25T12:00:00.000Z", "status": "1",
+                    "erros": [{"codigo": "107501", "mensagem": "UFR sem vínculo"}],
+                }]),
+                httpx.Response(207, json=[{
+                    "referenciaExterna": referencia_externa, "protocolo": "proto-view-4b",
+                    "idDoContrato": "cerc-view-4b",
+                    "dataHoraProcessamento": "2026-08-25T12:05:00.000Z", "status": "0", "erros": [],
+                }]),
+            ]
         )
 
         cliente = Client()
         r1 = cliente.post(URL, data=json.dumps(_payload(referencia_externa)), content_type="application/json")
+        assert r1.status_code == 422
+        rejeitado = buscar_contrato_por_referencia(FINANCIADOR_TESTE, referencia_externa)
+        assert rejeitado["status"] == "REJEITADO_ESTRUTURAL"
+
         r2 = cliente.post(URL, data=json.dumps(_payload(referencia_externa)), content_type="application/json")
 
-        assert r1.status_code == 422
-        assert r2.status_code == 422
+        assert r2.status_code == 202
         corpo2 = r2.json()
-        assert corpo2["status"] == "REJEITADO_ESTRUTURAL"
-        assert rota.call_count == 1  # replay não bate na CERC de novo
+        assert corpo2["status"] == "AGUARDANDO_WEBHOOK"
+        assert corpo2["protocolo"] == "proto-view-4b"
+        assert rota.call_count == 2  # ressubmissão bate na CERC de novo (ao contrário do replay)
+
+        db = get_db(FINANCIADOR_TESTE)
+        linhas = db.table("contrato").select("*").eq("referencia_externa", referencia_externa).execute()
+        assert len(linhas.data) == 1  # o grafo antigo foi substituído, não duplicado
+        novo = linhas.data[0]
+        assert novo["id"] != rejeitado["id"]
+        assert novo["status"] == "AGUARDANDO_WEBHOOK"
+        assert novo["identificador_contrato"] == rejeitado["identificador_contrato"]
+
+        # nada do grafo antigo sobreviveu
+        for tabela in ("garantia", "contrato_domicilio", "contrato_parcela", "contrato_evento"):
+            antigas = db.table(tabela).select("*").eq("contrato_id", rejeitado["id"]).execute()
+            assert antigas.data == [], tabela
+        # e o novo grafo está completo
+        assert len(db.table("garantia").select("*").eq("contrato_id", novo["id"]).execute().data) == 1
+        assert len(db.table("contrato_parcela").select("*").eq("contrato_id", novo["id"]).execute().data) == 1
+    finally:
+        _limpar(referencia_externa)
+
+
+@respx.mock
+def test_criar_contrato_rejeicao_estrutural_devolve_erros_da_cerc_e_grava_contrato_evento():
+    # Revisão final, achado 8: os erros[] do item 207 eram lidos e descartados —
+    # o chamador recebia um 422 sem nenhuma indicação do motivo, e nada ficava
+    # na trilha de auditoria.
+    referencia_externa = "CTR-TESTE-VIEW-REJEITADO-ERROS"
+    _limpar(referencia_externa)
+    try:
+        _mock_token()
+        erros_cerc = [
+            {"codigo": "107501", "mensagem": "UFR sem vínculo"},
+            {"codigo": "107502", "mensagem": "arranjo não habilitado"},
+        ]
+        respx.put("https://ap-homolog.cerc.inf.br/v15/contratos").mock(
+            return_value=httpx.Response(207, json=[{
+                "referenciaExterna": referencia_externa, "protocolo": "proto-view-erros",
+                "dataHoraProcessamento": "2026-08-25T12:00:00.000Z", "status": "1",
+                "erros": erros_cerc,
+            }])
+        )
+
+        response = Client().post(URL, data=json.dumps(_payload(referencia_externa)), content_type="application/json")
+
+        assert response.status_code == 422
+        corpo = response.json()
+        assert corpo["erros"] == erros_cerc
+        assert corpo["protocolo"] == "proto-view-erros"
+
+        contrato = buscar_contrato_por_referencia(FINANCIADOR_TESTE, referencia_externa)
+        eventos = get_db(FINANCIADOR_TESTE).table("contrato_evento").select("*").eq("contrato_id", contrato["id"]).execute()
+        assert len(eventos.data) == 1
+        assert eventos.data[0]["tipo"] == "rejeicao_estrutural"
+        assert eventos.data[0]["payload"]["erros"] == erros_cerc
+    finally:
+        _limpar(referencia_externa)
+
+
+@pytest.mark.parametrize("corpo_json", ["[]", '"apenas uma string"', "42", "null"])
+def test_criar_contrato_corpo_json_nao_objeto_retorna_400(corpo_json):
+    # Revisão final, achado 7: json.loads aceita qualquer valor JSON de topo;
+    # payload.get(...) num array/string/número/None explodia com AttributeError
+    # (500) em vez de devolver um 400 limpo.
+    response = Client().post(URL, data=corpo_json, content_type="application/json")
+    assert response.status_code == 400
+    assert "objeto JSON" in response.json()["erro"]
+
+
+@respx.mock
+def test_criar_contrato_falha_ao_persistir_apos_207_retorna_500_e_nao_propaga(monkeypatch):
+    # Revisão final, achados 1/2 (Parte B): tudo entre "a CERC aceitou" e a
+    # resposta HTTP era completamente desprotegido. Qualquer falha ali significa
+    # dado financeiro real submetido à CERC sem registro local — tem que virar
+    # um 500 logado com protocolo/referência, nunca uma exceção não tratada.
+    referencia_externa = "CTR-TESTE-VIEW-FALHA-PERSISTIR"
+    _limpar(referencia_externa)
+    try:
+        _mock_token()
+        respx.put("https://ap-homolog.cerc.inf.br/v15/contratos").mock(
+            return_value=httpx.Response(207, json=[{
+                "referenciaExterna": referencia_externa, "protocolo": "proto-view-boom",
+                "idDoContrato": "cerc-view-boom", "dataHoraProcessamento": "2026-08-25T12:00:00.000Z",
+                "status": "0", "erros": [],
+            }])
+        )
+
+        def _explode(*args, **kwargs):
+            raise RuntimeError("banco caiu no meio da persistência")
+
+        monkeypatch.setattr("apps.contratos.views.inserir_contrato_criado", _explode)
+
+        response = Client().post(URL, data=json.dumps(_payload(referencia_externa)), content_type="application/json")
+
+        assert response.status_code == 500
+        corpo = response.json()
+        # o protocolo precisa voltar (e ir para o log) para permitir conciliação manual
+        assert corpo["protocolo"] == "proto-view-boom"
+        assert corpo["referenciaExterna"] == referencia_externa
+    finally:
+        _limpar(referencia_externa)
+
+
+@respx.mock
+def test_criar_contrato_207_com_array_vazio_retorna_500_em_vez_de_index_error():
+    referencia_externa = "CTR-TESTE-VIEW-207-VAZIO"
+    _limpar(referencia_externa)
+    try:
+        _mock_token()
+        respx.put("https://ap-homolog.cerc.inf.br/v15/contratos").mock(
+            return_value=httpx.Response(207, json=[])
+        )
+
+        response = Client().post(URL, data=json.dumps(_payload(referencia_externa)), content_type="application/json")
+
+        assert response.status_code == 500
+        assert buscar_contrato_por_referencia(FINANCIADOR_TESTE, referencia_externa) is None
     finally:
         _limpar(referencia_externa)
 

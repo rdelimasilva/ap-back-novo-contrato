@@ -70,16 +70,19 @@ CAMPOS_OBRIGATORIOS_NIVEL_CONTRATO = (
 
 
 def _validar_campos_obrigatorios(payload: dict) -> None:
-    # `campo not in payload` (ausência da CHAVE), não um teste de "falsy" — o
-    # bug real é o KeyError de contrato_repository.inserir_contrato_criado
-    # (payload_validado["campo"]) quando a CHAVE nunca chegou no payload, não
-    # o valor estar vazio/None quando presente. Um teste "falsy" aqui
-    # quebraria test_validar_criacao_contrato_c18_bloqueio_judicial_sem_identificador
-    # (Tarefa 1, já mesclada), que passa identificadorContrato="" de propósito
-    # para exercitar C18 — esse "" é um valor de payload legítimo (a chave
-    # existe), não um payload malformado.
+    # `payload.get(campo) is None`, não um teste de "falsy" genérico nem um
+    # `campo not in payload` puro:
+    #   - pega a ausência da CHAVE (`.get()` de chave inexistente é None) — o
+    #     bug original: KeyError de contrato_repository.inserir_contrato_criado
+    #     (payload_validado["campo"]) DEPOIS da chamada à CERC já ter sido gasta;
+    #   - pega também o `null` JSON EXPLÍCITO (chave presente, valor None), que
+    #     grava NULL numa coluna NOT NULL — mesmo estrago, um passo depois;
+    #   - NÃO pega string vazia, então
+    #     test_validar_criacao_contrato_c18_bloqueio_judicial_sem_identificador
+    #     (que passa identificadorContrato="" de propósito) segue caindo em C18,
+    #     que é a regra que de fato descreve aquele caso.
     for campo in CAMPOS_OBRIGATORIOS_NIVEL_CONTRATO:
-        if campo not in payload:
+        if payload.get(campo) is None:
             raise ValidationError("CAMPO_OBRIGATORIO", f"'{campo}' é obrigatório")
 
 
@@ -128,6 +131,16 @@ def validar_criacao_contrato(payload: dict, *, hoje: date, ativos_arranjos: set)
         eh_raiz = _eh_raiz(documento_ufr)
         validar_c10_raiz_titular_igual_ufr(documento_titular, documento_ufr, eh_raiz)
         validar_c11_raiz_documento_unico([d for d in (documento_ufr, documento_titular) if d], eh_raiz)
+
+        # numeroDocumentoTitular mapeia para contrato_domicilio.numero_documento_titular,
+        # que é NOT NULL — e nenhum validador C0x o cobre (C15 só olha
+        # tipoConta/numeroConta, C16 só ispb/compe/agencia). Sem este guard, a
+        # ausência dele só apareceria como erro de banco DEPOIS da chamada à CERC.
+        if not domicilio.get("numeroDocumentoTitular"):
+            raise ValidationError(
+                "CAMPO_OBRIGATORIO",
+                "'garantias[].domicilioPagamento.numeroDocumentoTitular' é obrigatório",
+            )
 
         validar_c15_numero_conta(domicilio["tipoConta"], domicilio["numeroConta"])
         validar_c16_domicilio_formatos(domicilio["ispb"], domicilio.get("compe"), domicilio["agencia"])

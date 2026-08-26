@@ -1,9 +1,14 @@
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
-from apps.contratos.contrato_repository import buscar_contrato_por_referencia, inserir_contrato_criado
+from apps.contratos import state_machine
+from apps.contratos.contrato_repository import (
+    buscar_contrato_por_referencia,
+    inserir_contrato_criado,
+    remover_contrato_rejeitado,
+)
 from shared.cloudsql_client import get_db
 
 FINANCIADOR_TESTE = "12345678000199"
@@ -149,5 +154,115 @@ def test_inserir_contrato_criado_garantia_sem_domicilio_nao_gera_linha_de_domici
         garantias = db.table("garantia").select("*").eq("contrato_id", contrato["id"]).execute()
         assert len(garantias.data) == 1
         assert garantias.data[0]["referencia_externa"] == f"{referencia_externa}-G1"
+    finally:
+        _limpar(referencia_externa)
+
+
+def test_inserir_contrato_criado_grava_enviado_em():
+    # Revisão final, achado 6: enviado_em nunca era escrito em lugar nenhum —
+    # sem ele, um futuro job de conciliação de SLA não tem como medir há quanto
+    # tempo o contrato espera pelo webhook.
+    referencia_externa = "CTR-TESTE-REPO-ENVIADO-EM"
+    _limpar(referencia_externa)
+    try:
+        antes = datetime.now(timezone.utc)
+        contrato = inserir_contrato_criado(
+            FINANCIADOR_TESTE, _payload_validado(referencia_externa),
+            status="AGUARDANDO_WEBHOOK", protocolo="proto-enviado-em", id_contrato_cerc=None,
+        )
+
+        assert contrato["enviado_em"] is not None
+        depois = datetime.now(timezone.utc)
+        assert antes - timedelta(minutes=5) <= contrato["enviado_em"] <= depois + timedelta(minutes=5)
+    finally:
+        _limpar(referencia_externa)
+
+
+@pytest.mark.parametrize("status_pedido", ["AGUARDANDO_WEBHOOK", "REJEITADO_ESTRUTURAL"])
+def test_inserir_contrato_criado_nunca_deixa_o_contrato_preso_em_enviando(status_pedido):
+    # Revisão final, achado 5: a função agora insere `contrato` com o status
+    # PLACEHOLDER ENVIANDO, grava os filhos, e só então faz o UPDATE final para
+    # o status real. ENVIANDO só pode ser observável se o processo morrer no
+    # meio — uma chamada bem-sucedida tem que terminar exatamente no status
+    # pedido, tanto na linha persistida quanto no valor de retorno.
+    referencia_externa = "CTR-TESTE-REPO-SEM-ENVIANDO"
+    _limpar(referencia_externa)
+    try:
+        contrato = inserir_contrato_criado(
+            FINANCIADOR_TESTE, _payload_validado(referencia_externa),
+            status=status_pedido, protocolo="proto-enviando", id_contrato_cerc="cerc-enviando",
+        )
+
+        assert contrato["status"] == status_pedido
+        assert contrato["status"] != state_machine.ENVIANDO
+        assert contrato["protocolo_cerc"] == "proto-enviando"
+        assert contrato["id_contrato_cerc"] == "cerc-enviando"
+
+        persistido = buscar_contrato_por_referencia(FINANCIADOR_TESTE, referencia_externa)
+        assert persistido["status"] == status_pedido
+    finally:
+        _limpar(referencia_externa)
+
+
+def test_remover_contrato_rejeitado_apaga_o_grafo_inteiro():
+    # Revisão final, achados 1/2: o caminho de ressubmissão de um contrato
+    # REJEITADO_ESTRUTURAL depende disto para apagar a linha antiga ANTES de
+    # inserir a nova — senão o UNIQUE (cnpj_participante, identificador_contrato)
+    # estoura. Inclui uma linha de contrato_evento de propósito: ela também
+    # referencia contrato(id) e bloquearia o DELETE se não fosse removida.
+    referencia_externa = "CTR-TESTE-REPO-REMOVER"
+    _limpar(referencia_externa)
+    try:
+        payload = _payload_validado(referencia_externa, com_anteriores=True, com_parcelas=True)
+        contrato = inserir_contrato_criado(
+            FINANCIADOR_TESTE, payload, status="REJEITADO_ESTRUTURAL",
+            protocolo="proto-remover", id_contrato_cerc=None,
+        )
+        contrato_id = contrato["id"]
+
+        db = get_db(FINANCIADOR_TESTE)
+        db.table("contrato_evento").insert({
+            "contrato_id": contrato_id, "tipo": "rejeicao_estrutural",
+            "payload": {"status": "1", "erros": [{"codigo": "107501"}]},
+            "ocorrido_em": datetime.now(timezone.utc),
+        }).execute()
+
+        remover_contrato_rejeitado(FINANCIADOR_TESTE, contrato_id)
+
+        assert buscar_contrato_por_referencia(FINANCIADOR_TESTE, referencia_externa) is None
+        for tabela in (
+            "garantia", "contrato_domicilio", "contrato_parcela",
+            "contrato_contrato_anterior", "contrato_evento",
+        ):
+            assert db.table(tabela).select("*").eq("contrato_id", contrato_id).execute().data == [], tabela
+    finally:
+        _limpar(referencia_externa)
+
+
+def test_remover_contrato_rejeitado_libera_o_unique_de_identificador_contrato():
+    # A prova direta do achado 1: depois de remover o rejeitado, um contrato
+    # NOVO com o MESMO identificadorContrato (é a mesma operação sendo
+    # retentada) entra sem violar UNIQUE (cnpj_participante, identificador_contrato).
+    referencia_externa = "CTR-TESTE-REPO-REUSO-IDENT"
+    _limpar(referencia_externa)
+    try:
+        payload = _payload_validado(referencia_externa)
+        payload["identificadorContrato"] = "OP-TESTE-REPO-REUSO"
+        rejeitado = inserir_contrato_criado(
+            FINANCIADOR_TESTE, payload, status="REJEITADO_ESTRUTURAL",
+            protocolo="proto-reuso-1", id_contrato_cerc=None,
+        )
+
+        remover_contrato_rejeitado(FINANCIADOR_TESTE, rejeitado["id"])
+
+        novo = inserir_contrato_criado(
+            FINANCIADOR_TESTE, payload, status="AGUARDANDO_WEBHOOK",
+            protocolo="proto-reuso-2", id_contrato_cerc="cerc-reuso-2",
+        )
+
+        assert novo["id"] != rejeitado["id"]
+        assert novo["identificador_contrato"] == "OP-TESTE-REPO-REUSO"
+        assert novo["referencia_externa"] == referencia_externa
+        assert novo["status"] == "AGUARDANDO_WEBHOOK"
     finally:
         _limpar(referencia_externa)

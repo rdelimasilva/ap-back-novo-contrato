@@ -10,7 +10,11 @@ from sqlalchemy.exc import DBAPIError
 from ulid import ULID
 
 from apps.contratos import state_machine
-from apps.contratos.contrato_repository import buscar_contrato_por_referencia, inserir_contrato_criado
+from apps.contratos.contrato_repository import (
+    buscar_contrato_por_referencia,
+    inserir_contrato_criado,
+    remover_contrato_rejeitado,
+)
 from apps.contratos.contrato_validation_orquestrador import validar_criacao_contrato
 from apps.contratos.validation import ValidationError
 from apps.contratos.webhook_dedupe import hash_evento
@@ -331,14 +335,39 @@ def criar_contrato(request, financiador_id: str):
     except json.JSONDecodeError:
         return JsonResponse({"erro": "corpo não é JSON válido"}, status=400)
 
+    # json.loads aceita qualquer valor JSON de topo (array, string, número,
+    # null) — só um objeto tem .get()/campos. Sem este guard, um corpo `[]`
+    # explodia com AttributeError (500) em vez de virar um 400 limpo. Mesmo
+    # padrão do receptor de webhook acima.
+    if not isinstance(payload, dict):
+        return JsonResponse({"erro": "corpo deve ser um objeto JSON"}, status=400)
+
     referencia_externa = payload.get("referenciaExterna")
+    # id do contrato REJEITADO_ESTRUTURAL que esta submissão substitui (se
+    # houver) — o grafo antigo é descartado logo antes de persistir o novo.
+    id_rejeitado_a_substituir = None
     if referencia_externa:
         existente = buscar_contrato_por_referencia(financiador_id, referencia_externa)
         if existente:
-            status_http_replay = 202 if existente["status"] != state_machine.REJEITADO_ESTRUTURAL else 422
-            return JsonResponse({
-                "id": existente["id"], "status": existente["status"], "referenciaExterna": referencia_externa,
-            }, status=status_http_replay)
+            if existente["status"] == state_machine.REJEITADO_ESTRUTURAL:
+                # RESSUBMISSÃO, não replay: um REJEITADO_ESTRUTURAL nunca foi
+                # registrado na CERC, então o chamador tem todo o direito de
+                # corrigir o payload e tentar de novo com o MESMO
+                # referenciaExterna. Curto-circuitar aqui (comportamento antigo)
+                # deixava o contrato num beco sem saída permanente: a única saída
+                # era um referenciaExterna NOVO — que, com o mesmo
+                # identificadorContrato (correto: é a mesma operação), estourava
+                # o UNIQUE (cnpj_participante, identificador_contrato) DEPOIS da
+                # CERC já ter sido chamada de novo.
+                id_rejeitado_a_substituir = existente["id"]
+            else:
+                # Qualquer outro status significa que a CERC aceitou/está
+                # processando/registrou: replay idempotente, não chama a CERC
+                # de novo.
+                return JsonResponse({
+                    "id": existente["id"], "status": existente["status"],
+                    "referenciaExterna": referencia_externa,
+                }, status=202)
 
     db = get_db(financiador_id)
     ativos = db.table("dominio_arranjo").select("codigo").eq("ativo", True).execute()
@@ -361,16 +390,62 @@ def criar_contrato(request, financiador_id: str):
         logger.exception("[CriarContrato] falha inesperada ao chamar a CERC (financiador=%s, referencia=%s)", financiador_id, referencia_externa)
         return JsonResponse({"erro": "falha ao comunicar com a CERC"}, status=502)
 
-    item = resultado[0]
-    novo_status = state_machine.estado_apos_207(tipo_operacao="C", status_207=item["status"])
+    # ---------------------------------------------------------------------
+    # QUARENTENA: daqui pra frente a CERC JÁ RECEBEU e processou a submissão —
+    # é dado financeiro real, já commitado do lado de lá. Qualquer exceção não
+    # tratada neste trecho (resultado vazio -> IndexError, item sem "status" ->
+    # KeyError, DBAPIError em qualquer escrita) significaria "submetido na CERC,
+    # nenhum registro local, nenhum log utilizável". Mesmo espírito da
+    # quarentena de processar_webhook_contrato acima — aqui não há linha de
+    # webhook_inbox para marcar, então a rede de segurança é logar protocolo +
+    # referência + financiador (o suficiente para conciliar manualmente) e
+    # responder com um código de erro em vez de propagar.
+    #
+    # O escopo começa DEPOIS do except da chamada à CERC de propósito: a
+    # ValidationError da validação local e as falhas de comunicação com a CERC
+    # já têm os seus próprios 422/502 acima e NÃO passam por aqui.
+    # ---------------------------------------------------------------------
+    protocolo = None
+    try:
+        if not resultado:
+            raise ValueError("resposta 207 da CERC não trouxe nenhum item")
+        item = resultado[0]
+        protocolo = item.get("protocolo") if isinstance(item, dict) else None
+        novo_status = state_machine.estado_apos_207(tipo_operacao="C", status_207=item["status"])
 
-    contrato = inserir_contrato_criado(
-        financiador_id, payload_validado, status=novo_status,
-        protocolo=item.get("protocolo"), id_contrato_cerc=item.get("idDoContrato"),
-    )
+        if id_rejeitado_a_substituir:
+            # ANTES do insert, obrigatoriamente: a linha antiga ocupa o mesmo
+            # (cnpj_participante, identificador_contrato) e o mesmo
+            # referencia_externa que a nova vai usar.
+            remover_contrato_rejeitado(financiador_id, id_rejeitado_a_substituir)
 
-    status_http = 202 if novo_status != state_machine.REJEITADO_ESTRUTURAL else 422
-    return JsonResponse({
-        "id": contrato["id"], "status": novo_status, "referenciaExterna": referencia_externa,
-        "protocolo": item.get("protocolo"),
-    }, status=status_http)
+        contrato = inserir_contrato_criado(
+            financiador_id, payload_validado, status=novo_status,
+            protocolo=protocolo, id_contrato_cerc=item.get("idDoContrato"),
+        )
+
+        corpo = {
+            "id": contrato["id"], "status": novo_status,
+            "referenciaExterna": referencia_externa, "protocolo": protocolo,
+        }
+        if novo_status == state_machine.REJEITADO_ESTRUTURAL:
+            # Devolve ao chamador POR QUE a CERC recusou (antes os erros eram
+            # lidos e descartados) e registra a recusa na trilha de auditoria.
+            corpo["erros"] = item.get("erros") or []
+            db.table("contrato_evento").insert({
+                "contrato_id": contrato["id"], "tipo": "rejeicao_estrutural",
+                "payload": item, "ocorrido_em": datetime.now(timezone.utc),
+            }).execute()
+
+        status_http = 202 if novo_status != state_machine.REJEITADO_ESTRUTURAL else 422
+        return JsonResponse(corpo, status=status_http)
+    except Exception:
+        logger.exception(
+            "[CriarContrato] SUBMISSÃO JÁ ACEITA PELA CERC mas falhou ao interpretar/persistir "
+            "localmente — CONCILIAR MANUALMENTE (financiador=%s, referencia=%s, protocolo=%s)",
+            financiador_id, referencia_externa, protocolo,
+        )
+        return JsonResponse({
+            "erro": "contrato submetido à CERC mas não persistido localmente; conciliação manual necessária",
+            "referenciaExterna": referencia_externa, "protocolo": protocolo,
+        }, status=500)

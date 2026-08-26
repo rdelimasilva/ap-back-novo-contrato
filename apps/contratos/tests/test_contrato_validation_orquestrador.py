@@ -223,3 +223,55 @@ def test_validar_criacao_contrato_campo_obrigatorio_nivel_contrato_ausente(campo
     with pytest.raises(ValidationError) as exc:
         validar_criacao_contrato(payload, hoje=HOJE, ativos_arranjos=ATIVOS_ARRANJOS)
     assert exc.value.codigo == "CAMPO_OBRIGATORIO"
+
+
+@pytest.mark.parametrize("campo_nulo", [
+    "referenciaExterna",
+    "identificadorContrato",
+    "cnpjDetentor",
+    "tipoEfeito",
+    "modalidadeOperacao",
+    "identificacaoGestaoEntidadeRegistradora",
+])
+def test_validar_criacao_contrato_campo_obrigatorio_com_null_explicito(campo_nulo):
+    # Revisão final, achado 4: a checagem antiga era `campo not in payload`, que
+    # só pegava a AUSÊNCIA da chave. Um `null` JSON explícito (chave presente,
+    # valor None) passava batido e ia gravar NULL numa coluna NOT NULL depois de
+    # a chamada à CERC já ter sido gasta.
+    payload = _payload_valido()
+    payload[campo_nulo] = None
+    with pytest.raises(ValidationError) as exc:
+        validar_criacao_contrato(payload, hoje=HOJE, ativos_arranjos=ATIVOS_ARRANJOS)
+    assert exc.value.codigo == "CAMPO_OBRIGATORIO"
+
+
+def test_validar_criacao_contrato_string_vazia_nao_e_tratada_como_ausente():
+    # Contraprova do teste acima: "" NÃO é None, então identificadorContrato=""
+    # continua chegando em C18 (a regra que de fato descreve esse caso), e não é
+    # sequestrado pelo guard de campos obrigatórios.
+    payload = _payload_valido(tipoEfeito="4", identificadorContrato="")
+    with pytest.raises(ValidationError) as exc:
+        validar_criacao_contrato(payload, hoje=HOJE, ativos_arranjos=ATIVOS_ARRANJOS)
+    assert exc.value.codigo == "C18"
+
+
+def test_validar_criacao_contrato_garantia_sem_numero_documento_titular():
+    # Revisão final, achado 3: numeroDocumentoTitular mapeia para uma coluna
+    # NOT NULL de contrato_domicilio e não era coberto por nenhum validador
+    # (C15 só olha tipoConta/numeroConta, C16 só ispb/compe/agencia). Levantar
+    # ValidationError aqui garante que a falha acontece na validação LOCAL —
+    # antes de qualquer chamada à CERC.
+    payload = _payload_valido()
+    del payload["garantias"][0]["domicilioPagamento"]["numeroDocumentoTitular"]
+    with pytest.raises(ValidationError) as exc:
+        validar_criacao_contrato(payload, hoje=HOJE, ativos_arranjos=ATIVOS_ARRANJOS)
+    assert exc.value.codigo == "CAMPO_OBRIGATORIO"
+    assert "numeroDocumentoTitular" in exc.value.mensagem
+
+
+def test_validar_criacao_contrato_garantia_com_numero_documento_titular_nulo():
+    payload = _payload_valido()
+    payload["garantias"][0]["domicilioPagamento"]["numeroDocumentoTitular"] = None
+    with pytest.raises(ValidationError) as exc:
+        validar_criacao_contrato(payload, hoje=HOJE, ativos_arranjos=ATIVOS_ARRANJOS)
+    assert exc.value.codigo == "CAMPO_OBRIGATORIO"
