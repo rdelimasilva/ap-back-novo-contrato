@@ -5,4 +5,5 @@ urlpatterns = [
     path("health", views.health),
     re_path(r"^webhooks/contrato/(?P<financiador_id>\d{14})$", views.webhook_contrato),
     path("webhooks/contrato/processar", views.processar_webhook_contrato),
+    re_path(r"^contratos/(?P<financiador_id>\d{14})$", views.criar_contrato),
 ]

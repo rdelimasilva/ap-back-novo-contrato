@@ -2,7 +2,7 @@ import base64
 import hmac
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from django.http import JsonResponse
 from django.views.decorators.http import require_POST
@@ -10,12 +10,16 @@ from sqlalchemy.exc import DBAPIError
 from ulid import ULID
 
 from apps.contratos import state_machine
+from apps.contratos.contrato_repository import buscar_contrato_por_referencia, inserir_contrato_criado
+from apps.contratos.contrato_validation_orquestrador import validar_criacao_contrato
+from apps.contratos.validation import ValidationError
 from apps.contratos.webhook_dedupe import hash_evento
 from apps.contratos.webhook_processor import (
     atualizacoes_contrato_do_evento,
     garantia_urs_do_evento,
     indicadores_do_evento,
 )
+from services.cerc.client import CercApiError, criar_contrato as cerc_criar_contrato
 from shared import pubsub_client
 from shared.cloudsql_client import get_db
 from shared.pubsub_auth import verificar_push_oidc
@@ -312,3 +316,60 @@ def processar_webhook_contrato(request):
     db.table("webhook_inbox").update({"processado_em": datetime.now(timezone.utc)}).eq("id", webhook_inbox_id).execute()
 
     return JsonResponse({}, status=204)
+
+
+@require_POST
+def criar_contrato(request, financiador_id: str):
+    """POST /api/v1/contratos/<financiador_id> — cria um contrato
+    (tipoOperacao=C). Valida localmente (C01-C20 aplicáveis a criação),
+    submete à CERC, interpreta o 207 e persiste o estado inicial. O
+    resultado REAL do registro chega depois pelo webhook (Planos 10/11)
+    — este endpoint responde 202 (aceito, processamento assíncrono), não
+    201/200 (SPEC-02 §0)."""
+    try:
+        payload = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"erro": "corpo não é JSON válido"}, status=400)
+
+    referencia_externa = payload.get("referenciaExterna")
+    if referencia_externa:
+        existente = buscar_contrato_por_referencia(financiador_id, referencia_externa)
+        if existente:
+            return JsonResponse({
+                "id": existente["id"], "status": existente["status"], "referenciaExterna": referencia_externa,
+            }, status=202)
+
+    db = get_db(financiador_id)
+    ativos = db.table("dominio_arranjo").select("codigo").eq("ativo", True).execute()
+    ativos_arranjos = {row["codigo"] for row in ativos.data}
+
+    try:
+        payload_validado = validar_criacao_contrato(payload, hoje=date.today(), ativos_arranjos=ativos_arranjos)
+    except ValidationError as erro:
+        return JsonResponse({"codigo": erro.codigo, "erro": erro.mensagem}, status=422)
+    except (KeyError, TypeError) as erro:
+        return JsonResponse({"erro": f"campo obrigatório ausente ou mal formado: {erro}"}, status=400)
+
+    payload_cerc = {**payload, "cnpjParticipante": financiador_id}
+    try:
+        resultado = cerc_criar_contrato(financiador_id, payload_cerc, correlacao_id=referencia_externa)
+    except CercApiError:
+        logger.exception("[CriarContrato] CERC respondeu erro (financiador=%s, referencia=%s)", financiador_id, referencia_externa)
+        return JsonResponse({"erro": "falha ao comunicar com a CERC"}, status=502)
+    except Exception:
+        logger.exception("[CriarContrato] falha inesperada ao chamar a CERC (financiador=%s, referencia=%s)", financiador_id, referencia_externa)
+        return JsonResponse({"erro": "falha ao comunicar com a CERC"}, status=502)
+
+    item = resultado[0]
+    novo_status = state_machine.estado_apos_207(tipo_operacao="C", status_207=item["status"])
+
+    contrato = inserir_contrato_criado(
+        financiador_id, payload_validado, status=novo_status,
+        protocolo=item.get("protocolo"), id_contrato_cerc=item.get("idDoContrato"),
+    )
+
+    status_http = 202 if novo_status != state_machine.REJEITADO_ESTRUTURAL else 422
+    return JsonResponse({
+        "id": contrato["id"], "status": novo_status, "referenciaExterna": referencia_externa,
+        "protocolo": item.get("protocolo"),
+    }, status=status_http)
