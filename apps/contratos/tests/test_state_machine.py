@@ -162,3 +162,54 @@ def test_indicador_critico_quando_criticidade_alta():
 def test_indicador_critico_quando_criticidade_baixa_e_falso():
     assert sm.indicador_critico("0") is False
     assert sm.indicador_critico("1") is False
+
+
+# --- Plano 14: 207 síncrono de uma operação pós-registro (I/B/P/R) ---
+
+@pytest.mark.parametrize("tipo_operacao,estado_espera", [
+    ("I", sm.INATIVANDO), ("B", sm.BAIXANDO), ("P", sm.RESILINDO_PARCIAL), ("R", sm.RESILINDO_TOTAL),
+])
+def test_estado_apos_207_pos_registro_sucesso_vai_para_espera(tipo_operacao, estado_espera):
+    assert sm.estado_apos_207_pos_registro(tipo_operacao, status_207="0") == estado_espera
+
+
+@pytest.mark.parametrize("tipo_operacao", ["I", "B", "P", "R"])
+def test_estado_apos_207_pos_registro_falha_volta_para_registrado(tipo_operacao):
+    # Rejeição ESTRUTURAL da OPERAÇÃO (207 status=1), não do contrato — o
+    # contrato já estava REGISTRADO antes desta tentativa e continua sendo.
+    # Mesma razão do Plano 13 para a falha via webhook, aplicada aqui ao
+    # caminho síncrono do 207.
+    assert sm.estado_apos_207_pos_registro(tipo_operacao, status_207="1") == sm.REGISTRADO
+
+
+# --- Plano 14: situação de uma NOVA requisição I/B/P/R, antes de chamar a CERC ---
+
+@pytest.mark.parametrize("tipo_operacao", ["I", "B", "P", "R"])
+def test_situacao_operacao_pos_registro_de_registrado_e_prosseguir(tipo_operacao):
+    assert sm.situacao_operacao_pos_registro(sm.REGISTRADO, tipo_operacao) == "PROSSEGUIR"
+
+
+@pytest.mark.parametrize("tipo_operacao,estado_espera,estado_terminal", [
+    ("I", sm.INATIVANDO, sm.INATIVADO),
+    ("B", sm.BAIXANDO, sm.BAIXADO),
+    ("P", sm.RESILINDO_PARCIAL, sm.RESILIDO_PARCIAL),
+    ("R", sm.RESILINDO_TOTAL, sm.RESILIDO_TOTAL),
+])
+def test_situacao_operacao_pos_registro_repetida_e_replay(tipo_operacao, estado_espera, estado_terminal):
+    # Requisição repetida da MESMA operação — já em espera, ou já concluída —
+    # é replay idempotente, não conflito.
+    assert sm.situacao_operacao_pos_registro(estado_espera, tipo_operacao) == "REPLAY"
+    assert sm.situacao_operacao_pos_registro(estado_terminal, tipo_operacao) == "REPLAY"
+
+
+@pytest.mark.parametrize("tipo_operacao,estado_atual", [
+    # Contrato ainda não chegou a REGISTRADO.
+    ("I", sm.AGUARDANDO_WEBHOOK), ("I", sm.ATUALIZANDO), ("I", sm.REJEITADO_ESTRUTURAL),
+    ("I", sm.REJEITADO), ("I", sm.PENDENTE_CONCILIACAO),
+    # A OUTRA operação está em curso ou já concluída — não pode inativar um
+    # contrato que está sendo baixado (ou já foi baixado), e vice-versa.
+    ("I", sm.BAIXANDO), ("I", sm.BAIXADO),
+    ("B", sm.INATIVANDO), ("B", sm.INATIVADO),
+])
+def test_situacao_operacao_pos_registro_de_outro_estado_e_conflito(tipo_operacao, estado_atual):
+    assert sm.situacao_operacao_pos_registro(estado_atual, tipo_operacao) == "CONFLITO"

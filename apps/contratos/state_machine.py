@@ -156,6 +156,52 @@ def estado_apos_operacao_pos_registro(estado_atual: str, tipo_operacao: str) -> 
     return _OPERACAO_PARA_ESTADO_ESPERA[tipo_operacao]
 
 
+def estado_apos_207_pos_registro(tipo_operacao: str, status_207: str) -> str:
+    """§8 (Plano 14): resultado SÍNCRONO (207) de uma submissão I/B/P/R —
+    distinto de `estado_apos_operacao_pos_registro`, que só decide o estado
+    de ESPERA a entrar quando a CERC aceita (status=0); esta função também
+    cobre o caminho de rejeição síncrona (status=1), que Plano 13 nunca
+    precisou tratar (não existia endpoint algum ainda).
+
+    status=0 -> delega para estado_apos_operacao_pos_registro (mesmo destino
+    de espera). status=1 -> rejeição ESTRUTURAL da OPERAÇÃO, não do
+    contrato — REGISTRADO (nunca REJEITADO_ESTRUTURAL, que implicaria que o
+    contrato em si nunca foi registrado). Mesma razão do Plano 13 para a
+    falha via webhook (INATIVANDO/BAIXANDO/... -> REGISTRADO em status=1),
+    aplicada aqui ao caminho síncrono."""
+    if status_207 == "1":
+        return REGISTRADO
+    return estado_apos_operacao_pos_registro(REGISTRADO, tipo_operacao)
+
+
+_OPERACAO_PARA_ESTADO_TERMINAL = {
+    "I": INATIVADO,
+    "B": BAIXADO,
+    "P": RESILIDO_PARCIAL,
+    "R": RESILIDO_TOTAL,
+}
+
+
+def situacao_operacao_pos_registro(estado_atual: str, tipo_operacao: str) -> str:
+    """§8 (Plano 14): o que fazer com uma NOVA requisição I/B/P/R, ANTES de
+    chamar a CERC — decide se o endpoint deve prosseguir, responder com um
+    replay idempotente, ou recusar por conflito.
+
+    "PROSSEGUIR": estado_atual == REGISTRADO — pode submeter à CERC.
+    "REPLAY": estado_atual já é o estado de ESPERA ou o TERMINAL desta MESMA
+    tipo_operacao (ex.: tipo_operacao="I" e estado_atual em
+    {INATIVANDO, INATIVADO}) — requisição repetida, não chama a CERC de
+    novo, quem chama devolve o estado atual como está.
+    "CONFLITO": qualquer outro estado_atual — inclui tanto "o contrato ainda
+    não chegou a REGISTRADO" quanto "a OUTRA operação pós-registro está em
+    curso ou já concluída" (ex.: tentar inativar um contrato BAIXANDO)."""
+    if estado_atual == REGISTRADO:
+        return "PROSSEGUIR"
+    if estado_atual == _OPERACAO_PARA_ESTADO_ESPERA.get(tipo_operacao) or estado_atual == _OPERACAO_PARA_ESTADO_TERMINAL.get(tipo_operacao):
+        return "REPLAY"
+    return "CONFLITO"
+
+
 _RESULTADO_PARA_SUBESTADO = {
     "0": NAO_APLICAVEL,
     "1": SUFICIENTE,
