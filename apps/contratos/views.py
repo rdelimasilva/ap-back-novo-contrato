@@ -11,6 +11,7 @@ from ulid import ULID
 
 from apps.contratos import state_machine
 from apps.contratos.contrato_repository import (
+    atualizar_status_pos_registro,
     buscar_contrato_por_referencia,
     inserir_contrato_criado,
     remover_contrato_rejeitado,
@@ -23,7 +24,12 @@ from apps.contratos.webhook_processor import (
     garantia_urs_do_evento,
     indicadores_do_evento,
 )
-from services.cerc.client import CercApiError, criar_contrato as cerc_criar_contrato
+from services.cerc.client import (
+    CercApiError,
+    baixar_contrato as cerc_baixar_contrato,
+    criar_contrato as cerc_criar_contrato,
+    inativar_contrato as cerc_inativar_contrato,
+)
 from shared import pubsub_client
 from shared.cloudsql_client import get_db
 from shared.pubsub_auth import verificar_push_oidc
@@ -449,3 +455,113 @@ def criar_contrato(request, financiador_id: str):
             "erro": "contrato submetido à CERC mas não persistido localmente; conciliação manual necessária",
             "referenciaExterna": referencia_externa, "protocolo": protocolo,
         }, status=500)
+
+
+def _operacao_pos_registro(request, financiador_id: str, tipo_operacao: str, cerc_fn):
+    """Núcleo comum de `inativar_contrato`/`baixar_contrato` (Plano 14) —
+    `I`/`B` são espelhos exatos um do outro (mesma forma de payload, mesma
+    máquina de estados), diferindo só em `tipo_operacao` e em qual função do
+    cliente CERC chamar. Segue o mesmo padrão de quarentena pós-CERC de
+    `criar_contrato` acima: uma vez que a CERC aceitou a submissão, qualquer
+    falha ao interpretar/persistir localmente vira 500 logado com protocolo +
+    referência (dado real já commitado do lado da CERC), nunca uma exceção
+    não tratada."""
+    try:
+        payload = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"erro": "corpo não é JSON válido"}, status=400)
+    if not isinstance(payload, dict):
+        return JsonResponse({"erro": "corpo deve ser um objeto JSON"}, status=400)
+
+    referencia_externa = payload.get("referenciaExterna")
+    if not referencia_externa:
+        return JsonResponse({"codigo": "CAMPO_OBRIGATORIO", "erro": "'referenciaExterna' é obrigatório"}, status=422)
+
+    contrato = buscar_contrato_por_referencia(financiador_id, referencia_externa)
+    if contrato is None:
+        return JsonResponse({"erro": f"contrato referenciaExterna={referencia_externa} não encontrado"}, status=404)
+
+    situacao = state_machine.situacao_operacao_pos_registro(contrato["status"], tipo_operacao)
+    if situacao == "CONFLITO":
+        return JsonResponse({
+            "erro": f"contrato está em '{contrato['status']}', operação '{tipo_operacao}' não permitida a partir deste estado",
+        }, status=409)
+    if situacao == "REPLAY":
+        return JsonResponse({
+            "id": contrato["id"], "status": contrato["status"], "referenciaExterna": referencia_externa,
+        }, status=202)
+
+    # "PROSSEGUIR": campos-chave lidos do que JÁ ESTÁ PERSISTIDO, nunca do
+    # corpo da requisição — identificadorContrato/documentoContratante são
+    # imutáveis (SPEC-02 §2.1) e este contrato já foi criado pelo Plano 12;
+    # decisão de arquitetura deste plano (ver seção "Architecture Decision").
+    payload_cerc = {
+        "identificadorContrato": contrato["identificador_contrato"],
+        "referenciaExterna": referencia_externa,
+        "documentoContratante": contrato["documento_contratante"],
+        "cnpjParticipante": financiador_id,
+    }
+    try:
+        resultado = cerc_fn(financiador_id, payload_cerc, correlacao_id=referencia_externa)
+    except CercApiError:
+        logger.exception(
+            "[OperacaoPosRegistro] CERC respondeu erro (financiador=%s, referencia=%s, operacao=%s)",
+            financiador_id, referencia_externa, tipo_operacao,
+        )
+        return JsonResponse({"erro": "falha ao comunicar com a CERC"}, status=502)
+    except Exception:
+        logger.exception(
+            "[OperacaoPosRegistro] falha inesperada ao chamar a CERC (financiador=%s, referencia=%s, operacao=%s)",
+            financiador_id, referencia_externa, tipo_operacao,
+        )
+        return JsonResponse({"erro": "falha ao comunicar com a CERC"}, status=502)
+
+    protocolo = None
+    try:
+        if not resultado:
+            raise ValueError("resposta 207 da CERC não trouxe nenhum item")
+        item = resultado[0]
+        protocolo = item.get("protocolo") if isinstance(item, dict) else None
+        novo_status = state_machine.estado_apos_207_pos_registro(tipo_operacao, item["status"])
+
+        atualizado = atualizar_status_pos_registro(financiador_id, contrato["id"], novo_status, protocolo)
+
+        get_db(financiador_id).table("contrato_evento").insert({
+            "contrato_id": contrato["id"], "tipo": f"operacao_pos_registro_{tipo_operacao}",
+            "payload": item, "ocorrido_em": datetime.now(timezone.utc),
+        }).execute()
+
+        corpo = {
+            "id": atualizado["id"], "status": novo_status,
+            "referenciaExterna": referencia_externa, "protocolo": protocolo,
+        }
+        if novo_status == state_machine.REGISTRADO:
+            # A operação em si foi recusada estruturalmente (207 status=1) —
+            # devolve por que, mesmo padrão de criar_contrato para
+            # REJEITADO_ESTRUTURAL.
+            corpo["erros"] = item.get("erros") or []
+
+        status_http = 202 if novo_status != state_machine.REGISTRADO else 422
+        return JsonResponse(corpo, status=status_http)
+    except Exception:
+        logger.exception(
+            "[OperacaoPosRegistro] SUBMISSÃO JÁ ACEITA PELA CERC mas falhou ao interpretar/persistir "
+            "localmente — CONCILIAR MANUALMENTE (financiador=%s, referencia=%s, operacao=%s, protocolo=%s)",
+            financiador_id, referencia_externa, tipo_operacao, protocolo,
+        )
+        return JsonResponse({
+            "erro": "operação submetida à CERC mas não persistida localmente; conciliação manual necessária",
+            "referenciaExterna": referencia_externa, "protocolo": protocolo,
+        }, status=500)
+
+
+@require_POST
+def inativar_contrato(request, financiador_id: str):
+    """POST /api/v1/contratos/<financiador_id>/inativar — tipoOperacao=I."""
+    return _operacao_pos_registro(request, financiador_id, "I", cerc_inativar_contrato)
+
+
+@require_POST
+def baixar_contrato(request, financiador_id: str):
+    """POST /api/v1/contratos/<financiador_id>/baixar — tipoOperacao=B."""
+    return _operacao_pos_registro(request, financiador_id, "B", cerc_baixar_contrato)
