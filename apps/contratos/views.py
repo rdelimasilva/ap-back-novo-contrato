@@ -4,7 +4,7 @@ import json
 import logging
 from datetime import date, datetime, timezone
 
-from django.http import JsonResponse
+from django.http import HttpResponseNotAllowed, JsonResponse
 from django.views.decorators.http import require_POST
 from sqlalchemy.exc import DBAPIError
 from ulid import ULID
@@ -14,6 +14,7 @@ from apps.contratos.contrato_repository import (
     atualizar_status_pos_registro,
     buscar_contrato_por_referencia,
     inserir_contrato_criado,
+    listar_contratos_do_financiador,
     remover_contrato_rejeitado,
 )
 from apps.contratos.contrato_validation_orquestrador import validar_criacao_contrato
@@ -328,7 +329,74 @@ def processar_webhook_contrato(request):
     return JsonResponse({}, status=204)
 
 
-@require_POST
+def _contrato_para_dto(c: dict) -> dict:
+    """Linha crua de `contrato` (snake_case) -> DTO de resposta (camelCase).
+    Compartilhado entre listar_contratos e detalhar_contrato — qualquer
+    campo adicionado aqui aparece nos dois endpoints."""
+    def _to_float_or_none(val):
+        """Converte valor (pode vir como string, Decimal, ou float) para float ou None."""
+        if val is None:
+            return None
+        if isinstance(val, (int, float)):
+            return float(val)
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
+    return {
+        "id": c["id"],
+        "referenciaExterna": c["referencia_externa"],
+        "identificadorContrato": c["identificador_contrato"],
+        "protocolo": c.get("protocolo_cerc"),
+        "idContratoCerc": c.get("id_contrato_cerc"),
+        "status": c["status"],
+        "statusGarantia": c.get("status_garantia"),
+        "cnpjParticipante": c["cnpj_participante"],
+        "documentoContratante": c["documento_contratante"],
+        "cnpjDetentor": c["cnpj_detentor"],
+        "tipoEfeito": c["tipo_efeito"],
+        "modalidadeOperacao": c["modalidade_operacao"],
+        "gestaoEntidadeRegistradora": c["gestao_entidade_registradora"],
+        "saldoDevedor": _to_float_or_none(c["saldo_devedor"]),
+        "limiteOperacaoGarantida": _to_float_or_none(c["limite_operacao_garantida"]),
+        "valorMantido": _to_float_or_none(c["valor_mantido"]),
+        "dataAssinatura": c["data_assinatura"],
+        "dataVencimento": c["data_vencimento"],
+        "repactuacao": c["repactuacao"],
+        "carteira": c.get("carteira"),
+        "tipoAvaliacao": c.get("tipo_avaliacao"),
+        "qtdUrsAlcancadas": c.get("qtd_urs_alcancadas"),
+        "valorUrsAlcancadas": _to_float_or_none(c.get("valor_urs_alcancadas")),
+        "resultadoDistribuicao": c.get("resultado_distribuicao"),
+        "indSobrecolateral": c.get("ind_sobrecolateral"),
+        "criadoEm": c.get("enviado_em"),
+        "confirmadoEm": c.get("confirmado_em"),
+    }
+
+
+def listar_contratos(request, financiador_id: str):
+    """GET /api/v1/contratos/<financiador_id> — lista os contratos do
+    financiador, mais recente primeiro. Filtros opcionais via querystring:
+    ?status=, ?limit=."""
+    status = request.GET.get("status") or None
+    limit_param = request.GET.get("limit")
+    limit = int(limit_param) if limit_param else None
+    contratos = listar_contratos_do_financiador(financiador_id, status=status, limit=limit)
+    return JsonResponse({"dados": [_contrato_para_dto(c) for c in contratos]})
+
+
+def contratos(request, financiador_id: str):
+    """Dispatcher da URL de coleção `/contratos/<financiador_id>`: POST cria
+    (tipoOperacao=C, comportamento existente de `criar_contrato`), GET lista.
+    Mesma URL para os dois verbos — convenção REST de coleção."""
+    if request.method == "POST":
+        return criar_contrato(request, financiador_id)
+    if request.method == "GET":
+        return listar_contratos(request, financiador_id)
+    return HttpResponseNotAllowed(["GET", "POST"])
+
+
 def criar_contrato(request, financiador_id: str):
     """POST /api/v1/contratos/<financiador_id> — cria um contrato
     (tipoOperacao=C). Valida localmente (C01-C20 aplicáveis a criação),

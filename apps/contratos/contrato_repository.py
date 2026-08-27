@@ -186,3 +186,15 @@ def atualizar_status_pos_registro(financiador_id: str, contrato_id: str, novo_st
         "status": novo_status, "protocolo_cerc": protocolo,
     }).eq("id", contrato_id).execute()
     return atualizado.data[0]
+
+
+def listar_contratos_do_financiador(financiador_id: str, status: str | None = None, limit: int | None = None) -> list[dict]:
+    """Lista as linhas de `contrato` do tenant, mais recente primeiro
+    (`enviado_em` desc). Filtro opcional por `status` (SPEC-02 §8)."""
+    query = get_db(financiador_id).table("contrato").select("*")
+    if status:
+        query = query.eq("status", status)
+    query = query.order("enviado_em", desc=True)
+    if limit:
+        query = query.limit(limit)
+    return query.execute().data

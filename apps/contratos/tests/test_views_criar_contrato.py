@@ -67,9 +67,10 @@ def _mock_token():
     )
 
 
-def test_criar_contrato_get_retorna_405():
+def test_criar_contrato_get_retorna_lista_nao_405():
     response = Client().get(URL)
-    assert response.status_code == 405
+    assert response.status_code == 200
+    assert "dados" in response.json()
 
 
 def test_criar_contrato_corpo_nao_json_retorna_400():
