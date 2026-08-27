@@ -5,13 +5,14 @@ import logging
 from datetime import date, datetime, timezone
 
 from django.http import HttpResponseNotAllowed, JsonResponse
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_GET, require_POST
 from sqlalchemy.exc import DBAPIError
 from ulid import ULID
 
 from apps.contratos import state_machine
 from apps.contratos.contrato_repository import (
     atualizar_status_pos_registro,
+    buscar_contrato_detalhado,
     buscar_contrato_por_referencia,
     inserir_contrato_criado,
     listar_contratos_do_financiador,
@@ -53,6 +54,18 @@ def _violacao_unique(erro: DBAPIError) -> bool:
     dicionário de campos da mensagem de erro do Postgres em `orig.args[0]`."""
     args = getattr(erro.orig, "args", None)
     return bool(args) and isinstance(args[0], dict) and args[0].get("C") == "23505"
+
+
+def _to_float_or_none(val):
+    """Converte valor (pode vir como string, Decimal, ou float) para float ou None."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
 
 
 def _autenticado(request, financiador_id: str) -> bool:
@@ -333,17 +346,6 @@ def _contrato_para_dto(c: dict) -> dict:
     """Linha crua de `contrato` (snake_case) -> DTO de resposta (camelCase).
     Compartilhado entre listar_contratos e detalhar_contrato — qualquer
     campo adicionado aqui aparece nos dois endpoints."""
-    def _to_float_or_none(val):
-        """Converte valor (pode vir como string, Decimal, ou float) para float ou None."""
-        if val is None:
-            return None
-        if isinstance(val, (int, float)):
-            return float(val)
-        try:
-            return float(val)
-        except (ValueError, TypeError):
-            return None
-
     return {
         "id": c["id"],
         "referenciaExterna": c["referencia_externa"],
@@ -369,10 +371,72 @@ def _contrato_para_dto(c: dict) -> dict:
         "qtdUrsAlcancadas": c.get("qtd_urs_alcancadas"),
         "valorUrsAlcancadas": _to_float_or_none(c.get("valor_urs_alcancadas")),
         "resultadoDistribuicao": c.get("resultado_distribuicao"),
-        "indSobrecolateral": c.get("ind_sobrecolateral"),
+        "indSobrecolateral": _to_float_or_none(c.get("ind_sobrecolateral")),
         "criadoEm": c.get("enviado_em"),
         "confirmadoEm": c.get("confirmado_em"),
     }
+
+
+def _ur_para_dto(ur: dict) -> dict:
+    return {
+        "cnpjCredenciadora": ur.get("cnpj_credenciadora"),
+        "documentoUsuarioFinalRecebedor": ur.get("documento_ufr"),
+        "documentoTitular": ur.get("documento_titular"),
+        "codigoArranjoPagamento": ur.get("codigo_arranjo"),
+        "dataLiquidacao": ur.get("data_liquidacao"),
+        "constituicao": ur.get("constituicao"),
+        "valorConstituidoTotal": _to_float_or_none(ur.get("valor_constituido_total")),
+        "valorBloqueado": _to_float_or_none(ur.get("valor_bloqueado")),
+        "indicadorOneracao": ur.get("indicador_oneracao"),
+        "regrasDivisao": ur.get("regras_divisao"),
+        "valorOnerado": _to_float_or_none(ur.get("valor_onerado")),
+        "valorConstituidoEfeito": _to_float_or_none(ur.get("valor_constituido_efeito")),
+        "origem": ur.get("origem"),
+    }
+
+
+def _garantia_para_dto(g: dict) -> dict:
+    return {
+        "id": g["id"],
+        "referenciaExterna": g["referencia_externa"],
+        "regrasDivisao": g["regras_divisao"],
+        "valorAOnerar": _to_float_or_none(g["valor_a_onerar"]),
+        "tipoDistribuicao": g.get("tipo_distribuicao"),
+        "definicaoUnidadeRecebivel": {
+            "listaCnpjCredenciadora": g["def_lista_credenciadoras"],
+            "listaCodigoArranjoPagamento": g["def_lista_arranjos"],
+            "documentoUsuarioFinalRecebedor": g.get("def_documento_ufr"),
+            "documentoTitular": g.get("def_documento_titular"),
+            "dataInicio": g["def_data_inicio"],
+            "dataFim": g["def_data_fim"],
+        },
+        "unidadesRecebiveisAlcancadas": [_ur_para_dto(ur) for ur in g.get("unidades_recebiveis", [])],
+    }
+
+
+def _indicador_para_dto(i: dict) -> dict:
+    return {
+        "indicador": i["indicador"],
+        "resultado": i.get("resultado"),
+        "parametros": i.get("parametros"),
+        "criticidade": i.get("criticidade"),
+        "observadoEm": i.get("observado_em"),
+    }
+
+
+@require_GET
+def detalhar_contrato(request, financiador_id: str, contrato_id: str):
+    """GET /api/v1/contratos/<financiador_id>/<id> — detalhe de um
+    contrato: dados do contrato + garantias (com URs alcançadas) +
+    indicadores de consistência."""
+    detalhe = buscar_contrato_detalhado(financiador_id, contrato_id)
+    if detalhe is None:
+        return JsonResponse({"erro": "contrato não encontrado"}, status=404)
+
+    corpo = _contrato_para_dto(detalhe)
+    corpo["garantias"] = [_garantia_para_dto(g) for g in detalhe["garantias"]]
+    corpo["indicadoresConsistencia"] = [_indicador_para_dto(i) for i in detalhe["indicadores_consistencia"]]
+    return JsonResponse(corpo)
 
 
 def listar_contratos(request, financiador_id: str):

@@ -198,3 +198,24 @@ def listar_contratos_do_financiador(financiador_id: str, status: str | None = No
     if limit:
         query = query.limit(limit)
     return query.execute().data
+
+
+def buscar_contrato_detalhado(financiador_id: str, contrato_id: str) -> dict | None:
+    """Linha de `contrato` + garantias (cada uma com as URs alcançadas
+    persistidas em `garantia_ur`) + indicadores de consistência. Tudo
+    snake_case — a conversão pra DTO camelCase é responsabilidade da view
+    (mesmo padrão do resto deste módulo)."""
+    db = get_db(financiador_id)
+    resultado = db.table("contrato").select("*").eq("id", contrato_id).execute()
+    if not resultado.data:
+        return None
+    contrato = resultado.data[0]
+
+    garantias = []
+    for g in db.table("garantia").select("*").eq("contrato_id", contrato_id).execute().data:
+        urs = db.table("garantia_ur").select("*").eq("garantia_id", g["id"]).execute().data
+        garantias.append({**g, "unidades_recebiveis": urs})
+
+    indicadores = db.table("indicador_consistencia").select("*").eq("contrato_id", contrato_id).execute().data
+
+    return {**contrato, "garantias": garantias, "indicadores_consistencia": indicadores}
