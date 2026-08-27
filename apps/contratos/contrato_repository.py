@@ -172,3 +172,17 @@ def inserir_contrato_criado(
     }).eq("id", contrato_id).execute()
 
     return atualizado.data[0]
+
+
+def atualizar_status_pos_registro(financiador_id: str, contrato_id: str, novo_status: str, protocolo: str | None) -> dict:
+    """Persiste o resultado de uma operação pós-registro (I/B/P/R, Plano 14)
+    sobre um contrato JÁ REGISTRADO — grava o status resultante (estado de
+    ESPERA em sucesso, ou de volta a REGISTRADO em rejeição estrutural
+    síncrona, ver state_machine.estado_apos_207_pos_registro) e o protocolo
+    mais recente. Ao contrário de `inserir_contrato_criado`, esta operação
+    não cria nenhuma linha em sub-tabela — o contrato e suas garantias já
+    existem por inteiro desde a criação."""
+    atualizado = get_db(financiador_id).table("contrato").update({
+        "status": novo_status, "protocolo_cerc": protocolo,
+    }).eq("id", contrato_id).execute()
+    return atualizado.data[0]

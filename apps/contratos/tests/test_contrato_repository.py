@@ -1,10 +1,12 @@
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import uuid
 
 import pytest
 
 from apps.contratos import state_machine
 from apps.contratos.contrato_repository import (
+    atualizar_status_pos_registro,
     buscar_contrato_por_referencia,
     inserir_contrato_criado,
     remover_contrato_rejeitado,
@@ -266,3 +268,48 @@ def test_remover_contrato_rejeitado_libera_o_unique_de_identificador_contrato():
         assert novo["status"] == "AGUARDANDO_WEBHOOK"
     finally:
         _limpar(referencia_externa)
+
+
+def _inserir_contrato_registrado_minimo(referencia_externa: str, identificador_contrato: str = "OP-TESTE-POS-REGISTRO") -> dict:
+    """Insere uma linha `contrato` mínima, já REGISTRADA, direto na tabela —
+    sem passar por `inserir_contrato_criado` (que exige um payload_validado
+    completo, com garantias/parcelas, irrelevante para testar uma função que
+    só faz UPDATE de duas colunas)."""
+    db = get_db(FINANCIADOR_TESTE)
+    contrato_id = str(uuid.uuid4())
+    db.table("contrato").insert({
+        "id": contrato_id,
+        "referencia_externa": referencia_externa,
+        "identificador_contrato": identificador_contrato,
+        "protocolo_cerc": "proto-original",
+        "status": "REGISTRADO",
+        "cnpj_participante": FINANCIADOR_TESTE,
+        "documento_contratante": "22751826000125",
+        "cnpj_detentor": FINANCIADOR_TESTE,
+        "tipo_efeito": "2",
+        "modalidade_operacao": "2",
+        "gestao_entidade_registradora": "1",
+        "saldo_devedor": Decimal("150000.00"),
+        "limite_operacao_garantida": Decimal("200000.00"),
+        "valor_mantido": Decimal("180000.00"),
+        "data_assinatura": date(2026, 8, 15),
+        "data_vencimento": date(2027, 8, 15),
+        "repactuacao": False,
+    }).execute()
+    return db.table("contrato").select("*").eq("id", contrato_id).execute().data[0]
+
+
+def test_atualizar_status_pos_registro_grava_novo_status_e_protocolo():
+    referencia_externa = "CTR-TESTE-REPO-POS-REGISTRO-1"
+    contrato = _inserir_contrato_registrado_minimo(referencia_externa)
+    try:
+        atualizado = atualizar_status_pos_registro(
+            FINANCIADOR_TESTE, contrato["id"], novo_status="INATIVANDO", protocolo="proto-novo",
+        )
+        assert atualizado["status"] == "INATIVANDO"
+        assert atualizado["protocolo_cerc"] == "proto-novo"
+        # nenhuma outra coluna foi tocada
+        assert atualizado["identificador_contrato"] == contrato["identificador_contrato"]
+        assert atualizado["documento_contratante"] == contrato["documento_contratante"]
+    finally:
+        get_db(FINANCIADOR_TESTE).table("contrato").delete().eq("id", contrato["id"]).execute()
