@@ -95,3 +95,24 @@ def test_listar_contratos_filtro_status_exclui_outros_status():
 def test_contratos_metodo_nao_suportado_retorna_405():
     response = Client().put(URL_LISTA, data="{}", content_type="application/json")
     assert response.status_code == 405
+
+
+def test_listar_contratos_limit_nao_inteiro_retorna_400():
+    response = Client().get(f"{URL_LISTA}?limit=abc")
+    assert response.status_code == 400
+    corpo = response.json()
+    assert "limit" in corpo.get("erro", "").lower()
+
+
+def test_listar_contratos_limit_negativo_retorna_400():
+    response = Client().get(f"{URL_LISTA}?limit=-5")
+    assert response.status_code == 400
+    corpo = response.json()
+    assert "limit" in corpo.get("erro", "").lower()
+
+
+def test_listar_contratos_limit_zero_retorna_400():
+    response = Client().get(f"{URL_LISTA}?limit=0")
+    assert response.status_code == 400
+    corpo = response.json()
+    assert "limit" in corpo.get("erro", "").lower()

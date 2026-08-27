@@ -381,7 +381,14 @@ def listar_contratos(request, financiador_id: str):
     ?status=, ?limit=."""
     status = request.GET.get("status") or None
     limit_param = request.GET.get("limit")
-    limit = int(limit_param) if limit_param else None
+    limit = None
+    if limit_param:
+        try:
+            limit = int(limit_param)
+            if limit <= 0:
+                return JsonResponse({"erro": "'limit' deve ser um inteiro positivo"}, status=400)
+        except ValueError:
+            return JsonResponse({"erro": "'limit' deve ser um inteiro positivo"}, status=400)
     contratos = listar_contratos_do_financiador(financiador_id, status=status, limit=limit)
     return JsonResponse({"dados": [_contrato_para_dto(c) for c in contratos]})
 
