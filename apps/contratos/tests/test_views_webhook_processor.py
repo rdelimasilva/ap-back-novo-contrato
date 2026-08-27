@@ -230,6 +230,46 @@ def test_processor_evento_sucesso_atualiza_contrato_e_persiste_urs_e_indicadores
         _limpar(contrato_id=contrato_id, garantia_id=garantia_id, webhook_inbox_id=webhook_id)
 
 
+def _envelope_confirmacao_pos_registro(referencia_externa):
+    """Espelha uma confirmação de INATIVAÇÃO/BAIXA (Plano 14): status=0, mas
+    sem resultadoDistribuicaoOnus — a operação não distribui garantia, então
+    nada em SPEC-02 confirma que a CERC envia esse campo aqui."""
+    return {
+        "tipoEvento": "contrato",
+        "dataHoraEvento": "2026-08-25T12:00:00.000Z",
+        "evento": {
+            "referenciaExterna": referencia_externa,
+            "protocolo": "proto-1",
+            "status": "0",
+            "dataHoraProcessamento": "2026-08-25T12:00:00.000Z",
+            "garantiasAlcancadas": [],
+            "indicadoresConsistencia": [],
+        },
+    }
+
+
+def test_processor_confirmacao_inativacao_sem_resultado_distribuicao_onus_atualiza_contrato():
+    # Finding 1 (revisão final): sem esta tolerância, evento["resultadoDistribuicaoOnus"]
+    # levanta KeyError, o webhook é colocado em quarentena, e o contrato fica
+    # preso em INATIVANDO para sempre (o UPDATE de status nunca acontece).
+    referencia_externa = "CTR-TESTE-PROC-INATIVACAO-SEM-RESULTADO"
+    contrato_id = _criar_contrato("INATIVANDO", referencia_externa)
+    webhook_id = _criar_webhook_inbox(_envelope_confirmacao_pos_registro(referencia_externa))
+    try:
+        response = Client().post(URL, data=_push_envelope(webhook_id), content_type="application/json")
+        assert response.status_code == 204
+
+        db = get_db(FINANCIADOR_TESTE)
+        contrato = db.table("contrato").select("*").eq("id", contrato_id).execute().data[0]
+        assert contrato["status"] == "INATIVADO"
+
+        linha_inbox = db.table("webhook_inbox").select("*").eq("id", webhook_id).execute()
+        assert linha_inbox.data[0]["processado_em"] is not None
+        assert linha_inbox.data[0]["erro"] is None
+    finally:
+        _limpar(contrato_id=contrato_id, webhook_inbox_id=webhook_id)
+
+
 def test_processor_evento_falha_marca_rejeitado_sem_escrever_urs():
     referencia_externa = "CTR-TESTE-PROC-FALHA"
     contrato_id = _criar_contrato("AGUARDANDO_WEBHOOK", referencia_externa)

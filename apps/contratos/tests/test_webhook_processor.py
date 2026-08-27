@@ -42,6 +42,23 @@ def test_atualizacoes_contrato_do_evento_status_garantia_insuficiente():
     assert resultado["status_garantia"] == "INSUFICIENTE"
 
 
+def test_atualizacoes_contrato_do_evento_sem_resultado_distribuicao_onus_nao_levanta():
+    # Plano 14: confirmação de INATIVAÇÃO/BAIXA não distribui garantia — nada
+    # em SPEC-02 confirma que a CERC envia resultadoDistribuicaoOnus nesse
+    # caso. Precisa não levantar KeyError (que quarentenaria o webhook e
+    # deixaria o contrato preso em INATIVANDO/BAIXANDO para sempre).
+    evento = _evento_sucesso()
+    del evento["resultadoDistribuicaoOnus"]
+
+    resultado = atualizacoes_contrato_do_evento(evento)
+
+    assert "resultado_distribuicao" not in resultado
+    assert "status_garantia" not in resultado
+    assert resultado["qtd_urs_alcancadas"] == 3
+    assert resultado["valor_urs_alcancadas"] == 15000.00
+    assert resultado["confirmado_em"] == "2026-08-25T12:00:00.000Z"
+
+
 def _ur(cnpj_credenciadora, documento_ufr, codigo_arranjo):
     return {
         "cnpjCredenciadora": cnpj_credenciadora,

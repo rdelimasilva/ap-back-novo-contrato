@@ -478,7 +478,15 @@ def _operacao_pos_registro(request, financiador_id: str, tipo_operacao: str, cer
         return JsonResponse({"codigo": "CAMPO_OBRIGATORIO", "erro": "'referenciaExterna' é obrigatório"}, status=422)
 
     contrato = buscar_contrato_por_referencia(financiador_id, referencia_externa)
-    if contrato is None:
+    if contrato is None or contrato["cnpj_participante"] != financiador_id:
+        # Trata "pertence a outro tenant" igual a "não encontrado" — defensivo:
+        # buscar_contrato_por_referencia filtra só por referencia_externa,
+        # nunca por cnpj_participante. Hoje o isolamento de tenant acontece no
+        # nível de banco (um Cloud SQL por financiador_id via get_db), mas o
+        # UNIQUE (cnpj_participante, identificador_contrato) do schema
+        # antecipa mais de um cnpj_participante compartilhando um banco — se
+        # isso um dia for verdade, esta checagem evita que uma operação
+        # DESTRUTIVA (inativar/baixar) atinja o contrato de outro tenant.
         return JsonResponse({"erro": f"contrato referenciaExterna={referencia_externa} não encontrado"}, status=404)
 
     situacao = state_machine.situacao_operacao_pos_registro(contrato["status"], tipo_operacao)
@@ -502,7 +510,16 @@ def _operacao_pos_registro(request, financiador_id: str, tipo_operacao: str, cer
         "cnpjParticipante": financiador_id,
     }
     try:
-        resultado = cerc_fn(financiador_id, payload_cerc, correlacao_id=referencia_externa)
+        # correlacao_id inclui tipo_operacao (Idempotency-Key da CERC) de
+        # propósito: criar_contrato já usa referencia_externa sozinho como sua
+        # própria correlacao_id, então uma criação (C) seguida de uma
+        # inativação (I)/baixa (B) no MESMO contrato, com a mesma
+        # referencia_externa, mandaria a MESMA Idempotency-Key com corpos
+        # DIFERENTES — um comportamento de idempotência conforme na CERC
+        # poderia devolver a resposta CACHEADA da criação em vez de processar
+        # a operação nova. design doc §"Idempotency-Key/referenciaExterna
+        # únicos nos POST mutantes".
+        resultado = cerc_fn(financiador_id, payload_cerc, correlacao_id=f"{referencia_externa}:{tipo_operacao}")
     except CercApiError:
         logger.exception(
             "[OperacaoPosRegistro] CERC respondeu erro (financiador=%s, referencia=%s, operacao=%s)",

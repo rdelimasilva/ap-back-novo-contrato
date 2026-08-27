@@ -19,17 +19,27 @@ from apps.contratos import state_machine
 def atualizacoes_contrato_do_evento(evento: dict) -> dict:
     """§5.2: campos do evento que atualizam a linha de `contrato` quando
     status=0. Quando status=1 (falha), o evento não traz nenhum desses
-    campos — o caller só atualiza `status` (via state_machine), nada mais."""
+    campos — o caller só atualiza `status` (via state_machine), nada mais.
+
+    `resultadoDistribuicaoOnus` é opcional aqui (Plano 14): a tabela
+    compactada da SPEC-02 §5.2 descreve a confirmação de CRIAÇÃO/ATUALIZAÇÃO,
+    onde uma distribuição de garantia de fato ocorreu; uma confirmação de
+    INATIVAÇÃO/BAIXA não distribui nada, e nada em SPEC-02 confirma que a
+    CERC envia esse campo nesse caso. Ausente, `resultado_distribuicao`/
+    `status_garantia` simplesmente não entram no dict — as colunas
+    correspondentes não são tocadas por este webhook."""
     if evento.get("status") != "0":
         return {}
-    resultado = evento["resultadoDistribuicaoOnus"]
-    return {
+    atualizacoes = {
         "qtd_urs_alcancadas": evento.get("quantidadeUnidadesRecebiveisAlcancadas"),
         "valor_urs_alcancadas": evento.get("valorUnidadesRecebiveisAlcancadas"),
         "confirmado_em": evento.get("dataHoraProcessamento"),
-        "resultado_distribuicao": resultado,
-        "status_garantia": state_machine.sub_estado_garantia(resultado),
     }
+    resultado = evento.get("resultadoDistribuicaoOnus")
+    if resultado is not None:
+        atualizacoes["resultado_distribuicao"] = resultado
+        atualizacoes["status_garantia"] = state_machine.sub_estado_garantia(resultado)
+    return atualizacoes
 
 
 def garantia_urs_do_evento(evento: dict, snapshot_em) -> list:
