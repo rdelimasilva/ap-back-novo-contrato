@@ -43,11 +43,11 @@ def _fetch_token(financiador_id: str) -> dict:
     config = get_tenant_config(financiador_id)
     response = httpx.post(
         os.environ["CERC_AUTH_URL"],
-        data={
-            "grant_type": "client_credentials",
-            "client_id": config["cerc_client_id"],
-            "client_secret": config["cerc_client_secret"],
-        },
+        # A CERC exige client_secret_basic (RFC 6749 §2.3.1) — client_id/secret
+        # no header Authorization, não no corpo. Enviar via `data=` (o padrão
+        # client_secret_post) é rejeitado com 401 pelo servidor OAuth deles.
+        auth=(config["cerc_client_id"], config["cerc_client_secret"]),
+        data={"grant_type": "client_credentials"},
         timeout=10.0,
     )
     response.raise_for_status()
