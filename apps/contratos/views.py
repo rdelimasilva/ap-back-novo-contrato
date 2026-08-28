@@ -19,6 +19,7 @@ from apps.contratos.contrato_repository import (
     remover_contrato_rejeitado,
 )
 from apps.contratos.contrato_validation_orquestrador import validar_criacao_contrato
+from apps.contratos.dominio_arranjo_repository import CODIGOS_ARRANJO_VIGENTES, sincronizar_arranjos
 from apps.contratos.validation import ValidationError
 from apps.contratos.webhook_dedupe import hash_evento
 from apps.contratos.webhook_processor import (
@@ -46,6 +47,11 @@ logger = logging.getLogger(__name__)
 # de propósito.
 DEFAULT_LISTAGEM_LIMIT = 200
 MAX_LISTAGEM_LIMIT = 1000
+
+# lista fixa — mesmo padrão de _TENANTS_JOBS_PERIODICOS em
+# ap-back-consulta-agenda/apps/agenda/views.py (design §14 ponto 3, não
+# resolvido ainda: descoberta dinâmica de tenants para jobs periódicos).
+_TENANTS_JOBS_PERIODICOS = ["12345678000199"]
 
 
 def health(request):
@@ -749,3 +755,23 @@ def inativar_contrato(request, financiador_id: str):
 def baixar_contrato(request, financiador_id: str):
     """POST /api/v1/contratos/<financiador_id>/baixar — tipoOperacao=B."""
     return _operacao_pos_registro(request, financiador_id, "B", cerc_baixar_contrato)
+
+
+@require_POST
+def sincronizar_dominio_arranjo(request):
+    """POST /api/v1/jobs/sincronizar-dominio-arranjo — Plano 16. Sem
+    financiador_id na URL: itera _TENANTS_JOBS_PERIODICOS (um Cloud SQL por
+    tenant). Disparado por Cloud Scheduler, mesmo OIDC dos outros jobs.
+    Erro num tenant não impede a sincronização dos demais."""
+    if not verificar_push_oidc(request):
+        return JsonResponse({"erro": "OIDC inválido"}, status=401)
+
+    resultado = {"tenants": {}}
+    for financiador_id in _TENANTS_JOBS_PERIODICOS:
+        try:
+            resultado["tenants"][financiador_id] = sincronizar_arranjos(financiador_id, CODIGOS_ARRANJO_VIGENTES)
+        except Exception:
+            logger.exception("[SincronizarDominioArranjo] Falha ao sincronizar (financiador=%s)", financiador_id)
+            resultado["tenants"][financiador_id] = {"erro": "falha ao sincronizar"}
+
+    return JsonResponse(resultado, status=200)

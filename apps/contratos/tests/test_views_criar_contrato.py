@@ -1,4 +1,5 @@
 import json
+from datetime import date, timedelta
 
 import httpx
 import pytest
@@ -38,7 +39,10 @@ def _payload(referencia_externa="CTR-TESTE-VIEW-1"):
                 "definicaoUnidadeRecebivel": {
                     "listaCnpjCredenciadora": ["99T"], "listaCodigoArranjoPagamento": ["99T"],
                     "documentoUsuarioFinalRecebedor": "22751826000125", "documentoTitular": "22751826000125",
-                    "dataInicio": "2026-08-26", "dataFim": "2027-08-15",
+                    # C08 exige dataInicio >= hoje: relativa a date.today(), não fixa,
+                    # para o teste não passar a falhar sozinho conforme o tempo avança.
+                    "dataInicio": (date.today() + timedelta(days=1)).isoformat(),
+                    "dataFim": (date.today() + timedelta(days=365)).isoformat(),
                 },
                 "regrasDivisao": "1", "valorAOnerar": 180000.00, "tipoDistribuicao": "padrao_pro_rata_ap",
             },

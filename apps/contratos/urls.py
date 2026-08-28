@@ -9,4 +9,5 @@ urlpatterns = [
     re_path(r"^contratos/(?P<financiador_id>\d{14})/(?P<contrato_id>[0-9a-f-]{36})$", views.detalhar_contrato),
     re_path(r"^contratos/(?P<financiador_id>\d{14})/inativar$", views.inativar_contrato),
     re_path(r"^contratos/(?P<financiador_id>\d{14})/baixar$", views.baixar_contrato),
+    path("jobs/sincronizar-dominio-arranjo", views.sincronizar_dominio_arranjo),
 ]
