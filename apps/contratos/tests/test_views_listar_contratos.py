@@ -116,3 +116,36 @@ def test_listar_contratos_limit_zero_retorna_400():
     assert response.status_code == 400
     corpo = response.json()
     assert "limit" in corpo.get("erro", "").lower()
+
+
+def test_listar_contratos_financiador_desconhecido_retorna_404():
+    response = Client().get("/api/v1/contratos/99999999000199")
+    assert response.status_code == 404
+
+
+def test_listar_contratos_limit_aplica_no_resultado():
+    referencia_1 = "CTR-TESTE-LISTA-LIMIT-1"
+    referencia_2 = "CTR-TESTE-LISTA-LIMIT-2"
+    _limpar(referencia_1)
+    _limpar(referencia_2)
+    try:
+        payload_1 = {**_payload_minimo(referencia_1), "garantias": [], "identificacaoContratosAnteriores": [], "parcelas": []}
+        payload_2 = {**_payload_minimo(referencia_2), "identificadorContrato": "OP-TESTE-LISTA-2", "garantias": [], "identificacaoContratosAnteriores": [], "parcelas": []}
+        inserir_contrato_criado(
+            FINANCIADOR_TESTE, payload_1, status=state_machine.AGUARDANDO_WEBHOOK,
+            protocolo="proto-lista-limit-1", id_contrato_cerc="cerc-lista-limit-1",
+        )
+        inserir_contrato_criado(
+            FINANCIADOR_TESTE, payload_2, status=state_machine.AGUARDANDO_WEBHOOK,
+            protocolo="proto-lista-limit-2", id_contrato_cerc="cerc-lista-limit-2",
+        )
+
+        response = Client().get(f"{URL_LISTA}?limit=1")
+        assert response.status_code == 200
+        dados = response.json()["dados"]
+        assert len(dados) == 1
+    finally:
+        for referencia_externa in (referencia_1, referencia_2):
+            contrato = buscar_contrato_por_referencia(FINANCIADOR_TESTE, referencia_externa)
+            if contrato:
+                remover_contrato_rejeitado(FINANCIADOR_TESTE, contrato["id"])

@@ -39,6 +39,14 @@ from shared.tenant_config import get_tenant_config
 
 logger = logging.getLogger(__name__)
 
+# listar_contratos (ver abaixo): sem ?limit= explícito, evita um
+# `SELECT * FROM contrato ORDER BY enviado_em DESC` sem teto — o frontend
+# chama listContratos() sem filtros a cada mount. MAX_LISTAGEM_LIMIT também
+# funciona como teto rígido mesmo quando o chamador passa um ?limit= grande
+# de propósito.
+DEFAULT_LISTAGEM_LIMIT = 200
+MAX_LISTAGEM_LIMIT = 1000
+
 
 def health(request):
     return JsonResponse({"status": "ok"})
@@ -429,7 +437,15 @@ def detalhar_contrato(request, financiador_id: str, contrato_id: str):
     """GET /api/v1/contratos/<financiador_id>/<id> — detalhe de um
     contrato: dados do contrato + garantias (com URs alcançadas) +
     indicadores de consistência."""
-    detalhe = buscar_contrato_detalhado(financiador_id, contrato_id)
+    try:
+        detalhe = buscar_contrato_detalhado(financiador_id, contrato_id)
+    except Exception:
+        # Mesmo raciocínio de _autenticado acima: financiador_id desconhecido
+        # faz get_db (via get_tenant_config) levantar um RuntimeError puro.
+        # Trata como "contrato não encontrado" — não 500, e não vaza se o
+        # tenant existe — fecha o isolamento entre tenants (um financiador não
+        # pode descobrir/enxergar contrato de outro via financiador_id alheio).
+        return JsonResponse({"erro": "contrato não encontrado"}, status=404)
     if detalhe is None:
         return JsonResponse({"erro": "contrato não encontrado"}, status=404)
 
@@ -445,7 +461,6 @@ def listar_contratos(request, financiador_id: str):
     ?status=, ?limit=."""
     status = request.GET.get("status") or None
     limit_param = request.GET.get("limit")
-    limit = None
     if limit_param:
         try:
             limit = int(limit_param)
@@ -453,7 +468,20 @@ def listar_contratos(request, financiador_id: str):
                 return JsonResponse({"erro": "'limit' deve ser um inteiro positivo"}, status=400)
         except ValueError:
             return JsonResponse({"erro": "'limit' deve ser um inteiro positivo"}, status=400)
-    contratos = listar_contratos_do_financiador(financiador_id, status=status, limit=limit)
+        # Capar em vez de rejeitar: um teto de servidor não é erro do
+        # cliente, então um ?limit= grande demais é silenciosamente reduzido
+        # a MAX_LISTAGEM_LIMIT em vez de virar 400.
+        limit = min(limit, MAX_LISTAGEM_LIMIT)
+    else:
+        limit = DEFAULT_LISTAGEM_LIMIT
+    try:
+        contratos = listar_contratos_do_financiador(financiador_id, status=status, limit=limit)
+    except Exception:
+        # Mesmo raciocínio de _autenticado/detalhar_contrato: financiador_id
+        # desconhecido faz get_db (via get_tenant_config) levantar um
+        # RuntimeError puro. Trata como "financiador não encontrado" — não
+        # 500, e não vaza se o tenant existe ou por que a resolução falhou.
+        return JsonResponse({"erro": "financiador não encontrado"}, status=404)
     return JsonResponse({"dados": [_contrato_para_dto(c) for c in contratos]})
 
 

@@ -63,6 +63,11 @@ def test_detalhar_contrato_inexistente_retorna_404():
     assert response.status_code == 404
 
 
+def test_detalhar_contrato_financiador_desconhecido_retorna_404():
+    response = Client().get("/api/v1/contratos/99999999000199/00000000-0000-0000-0000-000000000000")
+    assert response.status_code == 404
+
+
 def test_detalhar_contrato_traz_garantias_e_urs():
     referencia_externa = "CTR-TESTE-DETALHE-1"
     _limpar(referencia_externa)
@@ -94,5 +99,9 @@ def test_detalhar_contrato_traz_garantias_e_urs():
         assert len(corpo["garantias"][0]["unidadesRecebiveisAlcancadas"]) == 1
         assert corpo["garantias"][0]["unidadesRecebiveisAlcancadas"][0]["cnpjCredenciadora"] == "11111111000111"
         assert corpo["indicadoresConsistencia"] == []
+        assert isinstance(corpo["garantias"][0]["valorAOnerar"], float)
+        assert corpo["garantias"][0]["valorAOnerar"] == 180000.00
+        assert isinstance(corpo["garantias"][0]["unidadesRecebiveisAlcancadas"][0]["valorOnerado"], float)
+        assert corpo["garantias"][0]["unidadesRecebiveisAlcancadas"][0]["valorOnerado"] == 5000.00
     finally:
         _limpar(referencia_externa)
